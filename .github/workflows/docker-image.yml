@@ -28,32 +28,32 @@ jobs:
         username: __token__
         password: ${{ secrets.GITHUB_TOKEN }}
 
-    - name: Build and push Docker image (DE)
-      uses: docker/build-push-action@v2
-      with:
-        context: languages/de/docker
-        push: true
-        tags: |
-          ghcr.io/${{ github.repository }}:latest-de
-          ghcr.io/${{ github.repository }}:${{ github.sha }}-de
-        platforms: linux/amd64,linux/arm64
-        labels: |
-          org.opencontainers.image.source=${{ github.repository }}
-          org.opencontainers.image.revision=${{ github.sha }}
-          org.opencontainers.image.created=${{ github.event.created_at }}
-    - name: Build and push Docker image (EN)
-      uses: docker/build-push-action@v2
-      with:
-        context: main
-        push: true
-        tags: |
-          ghcr.io/${{ github.repository }}:latest-en
-          ghcr.io/${{ github.repository }}:${{ github.sha }}-en
-        platforms: linux/amd64,linux/arm64
-        labels: |
-          org.opencontainers.image.source=${{ github.repository }}
-          org.opencontainers.image.revision=${{ github.sha }}
-          org.opencontainers.image.created=${{ github.event.created_at }}
+    #- name: Build and push Docker image (DE)
+    #  uses: docker/build-push-action@v2
+    #  with:
+    #    context: languages/de/docker
+    #    push: true
+    #    tags: |
+    #      ghcr.io/${{ github.repository }}:latest-de
+    #      ghcr.io/${{ github.repository }}:${{ github.sha }}-de
+    #    platforms: linux/amd64,linux/arm64
+    #    labels: |
+    #      org.opencontainers.image.source=${{ github.repository }}
+    #      org.opencontainers.image.revision=${{ github.sha }}
+    #      org.opencontainers.image.created=${{ github.event.created_at }}
+    #- name: Build and push Docker image (EN)
+    #  uses: docker/build-push-action@v2
+    #  with:
+    #    context: main
+    #    push: true
+    #    tags: |
+    #      ghcr.io/${{ github.repository }}:latest-en
+    #      ghcr.io/${{ github.repository }}:${{ github.sha }}-en
+    #    platforms: linux/amd64,linux/arm64
+    #    labels: |
+    #      org.opencontainers.image.source=${{ github.repository }}
+    #      org.opencontainers.image.revision=${{ github.sha }}
+    #      org.opencontainers.image.created=${{ github.event.created_at }}
     - name: Build and push Docker image (DE-custom)
       uses: docker/build-push-action@v2
       with:
