@@ -89,7 +89,7 @@
             overflow-y: scroll;
             transition: transform 0.3s ease-in-out;
         }
-
+        
         /* Mobile sidebar styles */
         @media (max-width: 768px) {
             .sidebar {
@@ -100,11 +100,11 @@
                 z-index: 50;
                 transform: translateX(-100%);
             }
-
+            
             .sidebar.active {
                 transform: translateX(0);
             }
-
+            
             .overlay {
                 position: fixed;
                 top: 0;
@@ -117,32 +117,32 @@
                 visibility: hidden;
                 transition: opacity 0.3s ease-in-out, visibility 0.3s ease-in-out;
             }
-
+            
             .overlay.active {
                 opacity: 1;
                 visibility: visible;
             }
-
+            
             .main-content {
                 margin-left: 0;
             }
-
+            
             .menu-toggle {
                 display: block;
             }
         }
-
+        
         /* Desktop styles */
         @media (min-width: 769px) {
             .menu-toggle {
                 display: none;
             }
-
+            
             .overlay {
                 display: none;
             }
         }
-
+        
         .menu-toggle {
             background: none;
             border: none;
@@ -175,7 +175,7 @@
     <div class="flex h-screen">
         <!-- Overlay for mobile sidebar -->
         <div class="overlay" id="sidebarOverlay"></div>
-
+        
         <!-- Sidebar -->
         <div class="bg-gray-800 text-white w-64 flex flex-col sidebar" id="sidebar">
             <div class="px-6 py-4">
@@ -247,26 +247,13 @@
                 <div class="section bg-white p-6 rounded shadow">
                     <h3 class="text-lg font-semibold mb-4">Dashboard Übersicht</h3>
                     <p class="sec-text">Dies ist das Admin-Dashboard, in dem du Benutzer verwalten, Einstellungen konfigurieren und mehr kannst.</p>
-                    <!-- Form to restart container -->
-                     {% if container_restart %}
-                    <div class="p-6 rounded-lg shadow-sm mb-6" style="background-color: var(--main-bg-color); margin-top: 5px;">
-                        <h4 class="text-xl font-medium mb-3" style="color: var(--text-color);">Container Verwaltung</h4>
-                        <p class="sec-text mb-4">Wenn du den Container aus irgendeinem Grund neu starten musst, klicke auf die Schaltfläche unten.</p>
-
-                        <form method="POST" action="{{ url_for('dashboard') }}">
-                            <div class="flex justify-start">
-                                <button type="submit" class="px-6 py-3 bg-red-600 text-white rounded-lg shadow-md hover:bg-red-800 focus:outline-none focus:ring-4 focus:ring-red-300 transition ease-in-out duration-200">
-                                    Container neu starten
-                                </button>
-                            </div>
-                        </form>
-                    </div>
-                    {% endif %}
                 </div>
             </main>
         </div>
     </div>
 
+    <!-- Font Awesome for Icons -->
+    <script src="https://kit.fontawesome.com/a076d05399.js" crossorigin="anonymous"></script>
 
     <script>
         function toggleDarkMode() {
@@ -280,21 +267,21 @@
             // Store the theme preference in a cookie
             document.cookie = `theme=${newTheme}; path=/; max-age=${60 * 60 * 24 * 365}`; // 1 year
         }
-
+        
         // Sidebar toggle functionality
         document.addEventListener('DOMContentLoaded', function() {
             const sidebar = document.getElementById('sidebar');
             const menuToggle = document.getElementById('menuToggle');
             const overlay = document.getElementById('sidebarOverlay');
-
+            
             function toggleSidebar() {
                 sidebar.classList.toggle('active');
                 overlay.classList.toggle('active');
             }
-
+            
             menuToggle.addEventListener('click', toggleSidebar);
             overlay.addEventListener('click', toggleSidebar);
-
+            
             // Close sidebar when a navigation link is clicked (on mobile)
             const navLinks = document.querySelectorAll('.sidebar a');
             navLinks.forEach(link => {

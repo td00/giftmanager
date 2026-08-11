@@ -93,6 +93,11 @@
         [data-theme="dark"] .helplogo {
             filter: invert(1) brightness(1.5);
         }
+
+        .custom-field-group {
+            background-color: var(--card-bg-color);
+            border-color: var(--card-border-color);
+        }
     </style>
     <script>
         // Inline script to apply the theme from the cookie immediately
@@ -194,6 +199,34 @@ document.addEventListener('DOMContentLoaded', function() {
         }
     });
 });
+
+let customFieldCounter = 0;
+
+function addCustomField() {
+    const container = document.getElementById('customFieldsContainer');
+    const fieldId = customFieldCounter++;
+    
+    const fieldDiv = document.createElement('div');
+    fieldDiv.className = 'custom-field-group border rounded border-gray-300';
+    fieldDiv.innerHTML = `
+        <div class="flex items-center gap-2">
+            <input type="text" 
+                   name="custom_field_key_${fieldId}" 
+                   placeholder="Benutzerdefiniertes Feld (z.B., Schuhgröße)" 
+                   class="flex-1 border inputer rounded py-2 px-3 text-sm">
+            <input type="text" 
+                   name="custom_field_value_${fieldId}" 
+                   placeholder="Inhalt (z.B., 49)" 
+                   class="flex-1 border inputer rounded py-2 px-3 text-sm">
+            <button type="button" 
+                    onclick="this.parentElement.parentElement.remove()" 
+                    class="bg-red-500 text-white font-bold py-1 px-2 rounded text-sm">
+                ✕
+            </button>
+        </div>
+    `;
+    container.appendChild(fieldDiv);
+};
     </script>
 </head>
 <body class="body font-sans">
@@ -242,10 +275,21 @@ document.addEventListener('DOMContentLoaded', function() {
                     <input type="number" id="value" name="value" step="any" placeholder="Erwarteter Preis"
                         class="border rounded inputer py-2 px-3 w-full">
                 </div>
-                <button type="submit" class="bg-green-500 text-white px-3 py-2 rounded">Absenden</button>
+                <div class="mb-4">
+                    <label class="block sec-text font-bold">Benutzerdefinierte Felder (Optional):</label>
+                    <div id="customFieldsContainer" class="space-y-3 mt-2">
+                        <!-- Custom fields will be dynamically added here -->
+                    </div>
+                    <button type="button" 
+                            onclick="addCustomField()" 
+                            class="mt-2 bg-blue-500 hover:bg-blue-700 text-white font-bold py-2 px-4 rounded text-sm">
+                        + Benutzerdefiniertes Feld hinzufügen
+                    </button>
+                </div>
+                <button type="submit" class="bg-green-500 text-white px-3 py-2 rounded">Submit</button>
             </form>
         </section>
-    </main>
+    </main>      
     <script>
     const backButton = document.getElementById('backButton');
     backButton.addEventListener('click', () => {

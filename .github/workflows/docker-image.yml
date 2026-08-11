@@ -44,7 +44,7 @@ jobs:
     - name: Build and push Docker image (EN)
       uses: docker/build-push-action@v2
       with:
-        context: docker
+        context: main
         push: true
         tags: |
           ghcr.io/${{ github.repository }}:latest-en
