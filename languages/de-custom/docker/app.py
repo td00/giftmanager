@@ -294,6 +294,19 @@ def guest_allowed(f):
 def manifest():
     return send_from_directory('static', 'manifest.json')
 
+
+@app.route('/tailwind.min.css')
+def tailwind_css():
+    return send_from_directory('static', 'tailwind.min.css')
+
+@app.route('/fa.min.js')
+def fa_js():
+    return send_from_directory('static', 'fa.min.js')
+
+@app.route('/Sortable.min.js')
+def sortable_js():
+    return send_from_directory('static', 'Sortable.min.js')
+
 @app.route('/sw.js')
 def service_worker():
     response = make_response(send_from_directory('static', 'sw.js'))
@@ -302,8 +315,7 @@ def service_worker():
 
 @app.route('/favicon.ico')
 def favicon():
-    # Redirect to an external URL where your PNG favicon is hosted
-    return redirect("https://r2.icbest.ca/favicon-32x32.png")
+    return send_from_directory('static', 'favicon-32x32.png')
 
 @app.route('/avatars/')
 @app.route('/avatars/<path:filename>')
