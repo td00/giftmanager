@@ -9,31 +9,166 @@ from authlib.integrations.flask_client import OAuth
 import json, subprocess, secrets
 import os
 import random
+import re
+import shutil
+from PIL import Image
 from pathlib import Path
-from dotenv import load_dotenv, set_key
 from bs4 import BeautifulSoup
 from urllib.parse import urljoin
-dotenv_path = os.path.join(os.path.dirname(__file__), './data/.env') # Load the .env file from the specified path
-load_dotenv(dotenv_path)
 from requests.packages.urllib3.exceptions import InsecureRequestWarning
+
+import python_avatars
 
 # Disable SSL warnings to clean up your logs
 requests.packages.urllib3.disable_warnings(InsecureRequestWarning)
 
-app = Flask(__name__)
-app.config['SECRET_KEY'] = os.getenv("SECRET_KEY")
-app.config['SESSION_COOKIE_SAMESITE'] = 'Lax'  # Set SameSite attribute to Strict
-app.config['DATA'] = "./data"  # Directory where files are stored
+#
+# Config: settings.json (non-secrets) + environment variables (secrets)
+#
+# Priority for every read_env_variable() call:
+#   1. os.environ  — Docker/system env vars ALWAYS win/overrides all else (secrets AND settings)
+#   2. settings.json — UI-saved values (non-secrets only)
+#   3. hardcoded default
+#
+# Secrets (never written to disk):
+#   SECRET_KEY, MAILJET_API_KEY, MAILJET_API_SECRET, OIDC_CLIENT_ID, OIDC_CLIENT_SECRET
+#
+# Everything else lives in ./data/settings.json and is editable via the UI.
+#
+# Migration: on first boot, if settings.json is missing, the legacy ./data/.env
+# is read automatically — secrets are promoted to os.environ, everything else
+# is written to settings.json. Transparent, no user action required.
+#
 
+_DATA_DIR = Path("./data")
+_SETTINGS_PATH = _DATA_DIR / "settings.json"
+_LEGACY_ENV_PATH = _DATA_DIR / ".env"
+
+_SECRET_KEYS = {
+    "SECRET_KEY", "MAILJET_API_KEY", "MAILJET_API_SECRET",
+    "OIDC_CLIENT_ID", "OIDC_CLIENT_SECRET",
+}
+
+_SETTINGS_DEFAULTS = {
+    "SYSTEM_EMAIL": "",
+    "DELETE_DAYS": "30",
+    "OIDC_SERVER_METADATA_URL": "",
+    "OIDC_LOGOUT_URL": "",
+    "PRIMARY_OIDC_FIELD": "email",
+    "SECONDARY_OIDC_FIELD": "preferred_username",
+    "PRIMARY_DB_FIELD": "email",
+    "SECONDARY_DB_FIELD": "username",
+    "ENABLE_AUTO_REGISTRATION": "false",
+    "LOGIN_PAGE_MESSAGE": "No account? Contact a family member to create an account!",
+    "ENABLE_DEFAULT_LOGIN": "true",
+    "REORDERING": "true",
+    "IMGENABLED": "false",
+    "ENABLE_LINK_SHARING": "true",
+    "ENABLE_SELF_REGISTRATION": "false",
+    "JOINING_CODE": "",
+    "CURRENCY_SYMBOL": "$",
+    "CURRENCY_POSITION": "before",
+    "HIDE_PURCHASER": "user_choice",
+}
+
+def _parse_dotenv_file(path: Path) -> dict:
+    result = {}
+    try:
+        with open(path, 'r') as f:
+            for line in f:
+                line = line.strip()
+                if not line or line.startswith('#') or '=' not in line:
+                    continue
+                key, _, value = line.partition('=')
+                key = key.strip()
+                value = value.strip()
+                if value and len(value) >= 2 and value[0] in ('"', "'") and value[-1] == value[0]:
+                    value = value[1:-1]
+                result[key] = value
+    except FileNotFoundError:
+        pass
+    except Exception as e:
+        print(f"[config] Warning: could not parse {path}: {e}")
+    return result
+
+def _load_or_migrate_settings() -> dict:
+
+    _DATA_DIR.mkdir(parents=True, exist_ok=True)
+
+    if not _SETTINGS_PATH.exists():
+        print("[config] settings.json not found — running one-time migration from legacy .env")
+        legacy = _parse_dotenv_file(_LEGACY_ENV_PATH)
+
+        # Promote secrets from legacy .env into os.environ (in-process only)
+        for key in _SECRET_KEYS:
+            if key in legacy and not os.environ.get(key):
+                os.environ[key] = legacy[key]
+                print(f"[config] Migrated secret {key} → os.environ")
+
+        # Build settings.json from defaults + non-secret legacy values
+        settings = dict(_SETTINGS_DEFAULTS)
+        for key, value in legacy.items():
+            if key not in _SECRET_KEYS:
+                settings[key] = value
+
+        with open(_SETTINGS_PATH, 'w') as f:
+            json.dump(settings, f, indent=2)
+        print(f"[config] settings.json created at {_SETTINGS_PATH}")
+    else:
+        with open(_SETTINGS_PATH, 'r') as f:
+            settings = json.load(f)
+        # Backfill any keys added in newer app versions
+        changed = False
+        for key, default in _SETTINGS_DEFAULTS.items():
+            if key not in settings:
+                settings[key] = default
+                changed = True
+        if changed:
+            with open(_SETTINGS_PATH, 'w') as f:
+                json.dump(settings, f, indent=2)
+
+    return settings
+
+# Loaded once at startup — module-level dict mutated by save_setting()
+_settings: dict = _load_or_migrate_settings()
+
+
+def read_env_variable(key, default=None):
+
+    env_val = os.environ.get(key)
+    if env_val is not None:
+        return env_val
+    if key not in _SECRET_KEYS:
+        return _settings.get(key, default)
+    return default
+
+
+def save_setting(key: str, value: str):
+
+    if key in _SECRET_KEYS:
+        print(f"[config] Ignored attempt to save secret '{key}' to settings.json — set it as an env var.")
+        return
+    if os.environ.get(key) is not None:
+        print(f"[config] Note: '{key}' is overridden by an environment variable; UI-saved value will be ignored.")
+    _settings[key] = value
+    with open(_SETTINGS_PATH, 'w') as f:
+        json.dump(_settings, f, indent=2)
+
+app = Flask(__name__)
+app.config['SECRET_KEY'] = os.environ.get("SECRET_KEY", "changethis-set-SECRET_KEY-env-var")
+app.config['SESSION_COOKIE_SAMESITE'] = 'Lax'
+app.config['DATA'] = "./data"
 
 app.config['IDEAS_FILE'] = Path(app.config['DATA'], 'ideas.json')
 app.config['USERS_FILE'] = Path(app.config['DATA'], 'users.json')
+app.config['AVATAR_DIR'] = Path(app.config['DATA'], 'avatars')
 
-mailjet_api_key = os.getenv("MAILJET_API_KEY")
-mailjet_api_secret = os.getenv("MAILJET_API_SECRET")
+app.config['AVATAR_CLAIM_TIMEOUT'] = 3600 # in seconds
+
+mailjet_api_key = os.environ.get("MAILJET_API_KEY", "")
+mailjet_api_secret = os.environ.get("MAILJET_API_SECRET", "")
 mailjet = Client(auth=(mailjet_api_key, mailjet_api_secret), version='v3.1')
 ph = PasswordHasher()
-
 
 
 def prepopulate_file(filename: str, data: str):
@@ -62,28 +197,14 @@ prepopulate_file(app.config['USERS_FILE'], """
         [
         ]""")
 
-prepopulate_file('./data/.env', """
-MAILJET_API_KEY=''
-MAILJET_API_SECRET=''
-SECRET_KEY='changethis'
-SYSTEM_EMAIL=''
-DELETE_DAYS='30'
-OIDC_CLIENT_ID=''
-OIDC_CLIENT_SECRET=''
-OIDC_SERVER_METADATA_URL=''
-OIDC_LOGOUT_URL=''
-PRIMARY_OIDC_FIELD='email'
-SECONDARY_OIDC_FIELD='preferred_username'
-PRIMARY_DB_FIELD='email'
-SECONDARY_DB_FIELD='username'
-ENABLE_AUTO_REGISTRATION='false'
-LOGIN_PAGE_MESSAGE='No account? Contact a family member to create an account!'
-ENABLE_DEFAULT_LOGIN='true'
-CONTAINER_ID='giftmanager'
-REORDERING='true'
-IMGENABLED='false'
-                 
-""")
+# Setup directory for avatars
+try:
+    os.mkdir(app.config['AVATAR_DIR'])
+except FileExistsError:
+    # If the directory already exists, we don't need to do anything
+    pass
+for i in range(1, 9):
+    shutil.copy(Path("static", "icons",f"avatar{i}.png"), Path(app.config['AVATAR_DIR'], f"avatar{i}.png"))
 
 def load_gift_ideas():
     with open(app.config['IDEAS_FILE'], 'r') as file:
@@ -181,19 +302,25 @@ def service_worker():
 
 @app.route('/favicon.ico')
 def favicon():
-    return send_from_directory('static', 'favicon-32x32.png')
+    # Redirect to an external URL where your PNG favicon is hosted
+    return redirect("https://r2.icbest.ca/favicon-32x32.png")
 
-@app.route('/tailwind.min.css')
-def tailwind_css():
-    return send_from_directory('static', 'tailwind.min.css')
+@app.route('/avatars/')
+@app.route('/avatars/<path:filename>')
+@login_required
+@guest_allowed
+def show_avatar(filename=""):
+    base = Path(app.config['AVATAR_DIR'])
 
-@app.route('/fa.min.js')
-def fa_js():
-    return send_from_directory('static', 'fa.min.js')
+    filename = Path(filename).name  # ← trims folders safely
 
-@app.route('/Sortable.min.js')
-def sortable_js():
-    return send_from_directory('static', 'Sortable.min.js')
+    avatar = base / filename
+
+    if avatar.is_file():
+        return send_from_directory(base, filename)
+
+    return send_from_directory(base, 'avatar1.png')
+
 
 @app.route('/change_email', methods=['POST'])
 @login_required
@@ -219,12 +346,36 @@ def change_email():
     flash('Email updated successfully.', 'success')
     return redirect(url_for('dashboard'))
 
+@app.route('/change_user_grouping', methods=['POST'])
+@login_required
+def change_user_grouping():
+    # Load users from JSON
+    users = load_users()
+
+    # Get new grouping setting from the form
+    if 'user_grouping' in request.form.keys():
+        grouping = request.form['user_grouping']
+    else:
+        grouping = 'false'
+
+    for user in users:
+        if user['username'] == session['username']:
+            user['dashboard_user_grouping'] = 'true' if grouping == 'true' else 'false'
+            break
+    else:
+        flash('User not found.', 'danger')
+        return redirect(url_for('dashboard'))
+
+    # Save the updated data back to the JSON file
+    save_users(users)
+
+    return redirect(url_for('dashboard'))
 
 def get_currency_symbol():
-    return os.getenv('CURRENCY_SYMBOL', '$')
+    return read_env_variable("CURRENCY_SYMBOL", "$")
 
 def get_currency_position():
-    return os.getenv('CURRENCY_POSITION', 'before')
+    return read_env_variable("CURRENCY_POSITION", "before")
 
 def format_currency(amount):
     symbol = get_currency_symbol()
@@ -238,12 +389,12 @@ def format_currency(amount):
 
 @app.context_processor
 def utility_processor():
-    # Use the existing get_full_name function that's already defined
     return dict(
-        get_full_name=get_full_name,  # This uses the function you already have
+        get_full_name=get_full_name, 
         format_currency=format_currency,
         get_currency_symbol=get_currency_symbol,
-        get_currency_position=get_currency_position
+        get_currency_position=get_currency_position,
+        generate_share_url=generate_share_url
     )
 
 
@@ -251,9 +402,9 @@ def utility_processor():
 oauth = OAuth(app)
 oauth.register(
     name="keycloak",
-    client_id=os.getenv("OIDC_CLIENT_ID"),
-    client_secret=os.getenv("OIDC_CLIENT_SECRET"),
-    server_metadata_url=os.getenv("OIDC_SERVER_METADATA_URL"),
+    client_id=read_env_variable("OIDC_CLIENT_ID"),
+    client_secret=read_env_variable("OIDC_CLIENT_SECRET"),
+    server_metadata_url=read_env_variable("OIDC_SERVER_METADATA_URL"),
     client_kwargs={"scope": "openid profile email phone"},
 )
 
@@ -305,10 +456,10 @@ def auth():
         return redirect(url_for("login"))
     
     # Retrieve fields dynamically from the environment
-    primary_oidc_field = os.getenv("PRIMARY_OIDC_FIELD", "").lower()
-    secondary_oidc_field = os.getenv("SECONDARY_OIDC_FIELD", "").lower()
-    primary_db_field = os.getenv("PRIMARY_DB_FIELD", "").lower()
-    secondary_db_field = os.getenv("SECONDARY_DB_FIELD", "").lower()
+    primary_oidc_field = read_env_variable("PRIMARY_OIDC_FIELD", "").lower()
+    secondary_oidc_field = read_env_variable("SECONDARY_OIDC_FIELD", "").lower()
+    primary_db_field = read_env_variable("PRIMARY_DB_FIELD", "").lower()
+    secondary_db_field = read_env_variable("SECONDARY_DB_FIELD", "").lower()
 
     # Get field values from OIDC user info
     primary_oidc_value = user_info.get(primary_oidc_field)
@@ -337,7 +488,7 @@ def auth():
         return redirect(url_for("dashboard"))
     
     # Handle auto-registration if enabled
-    if os.getenv("ENABLE_AUTO_REGISTRATION", "false").lower() == "true":
+    if read_env_variable("ENABLE_AUTO_REGISTRATION", "false").lower() == "true":
         # Create a new user profile
         new_user = {
             "username": user_info.get("preferred_username"),
@@ -378,7 +529,7 @@ def setup_profile():
         return redirect(url_for("dashboard"))
     
     # Check if default login is enabled
-    enable_default_login = os.getenv("ENABLE_DEFAULT_LOGIN", "true").lower() == "true"
+    enable_default_login = read_env_variable("ENABLE_DEFAULT_LOGIN", "true").lower() == "true"
 
     if request.method == "POST":
         # Handle form submission to update profile details
@@ -406,13 +557,10 @@ def setup_profile():
 
     return render_template("setup_profile.html", user=user, oidc_user_info=oidc_user_info, enable_default_login=enable_default_login)
 
-
 #OIDC END
 
 @app.route('/')
 def index():
-    if os.getenv("SECRET_KEY") in [None, '']:
-        return redirect(url_for('need_restart'))
 
     # Redirect logged-in users to the dashboard
     if 'username' in session:
@@ -434,16 +582,15 @@ def index():
     return redirect(url_for('login'))
 
 
-
 @app.route('/login', methods=['GET', 'POST'])
 def login():
     guests_exist_flag = guests_exist()
-    enable_default_login = os.getenv('ENABLE_DEFAULT_LOGIN', 'true').lower() == 'true'
-    enable_self_registration = os.getenv('ENABLE_SELF_REGISTRATION', 'false').lower() == 'true'
+    enable_default_login = read_env_variable('ENABLE_DEFAULT_LOGIN', 'true').lower() == 'true'
+    enable_self_registration = read_env_variable('ENABLE_SELF_REGISTRATION', 'false').lower() == 'true'
 
 
     # For GET requests, render the login page
-    oidc_client_id = os.getenv("OIDC_CLIENT_ID")  # Get OIDC Client ID
+    oidc_client_id = read_env_variable("OIDC_CLIENT_ID")  # Get OIDC Client ID
     oidc_enabled = bool(oidc_client_id)  # Check if OIDC is enabled
     login_message = read_env_variable("LOGIN_PAGE_MESSAGE") or "No account? Contact a family member to create an account."
     # If default login is disabled, render an OIDC-only login page
@@ -461,6 +608,15 @@ def login():
             # Authenticate user
             for user in users:
                 if user['username'].lower() == input_username:
+                    if user.get('shared_list', False):
+                        flash('User does not exist', 'login_error')
+                        return render_template(
+                            'login.html',
+                            oidc_enabled=oidc_enabled,
+                            login_message=login_message,
+                            guests_exist=guests_exist_flag,
+                            enable_self_registration=enable_self_registration
+                        )
                     # Verify the password hash
                     if verify_password(user['password'], password):
                         session['username'] = user['username']
@@ -487,12 +643,12 @@ def guests_exist():
 def register():
     """Self-registration page for new users"""
     # Check if self-registration is enabled
-    if not os.getenv('ENABLE_SELF_REGISTRATION', 'false').lower() == 'true':
+    if not read_env_variable('ENABLE_SELF_REGISTRATION', 'false').lower() == 'true':
         flash('Self-registration is not enabled. Please contact an administrator.', 'danger')
         return redirect(url_for('login'))
     
     # Get joining code for template
-    joining_code = os.getenv('JOINING_CODE', '')
+    joining_code = read_env_variable('JOINING_CODE', '')
     
     if request.method == 'POST':
         # Get form data
@@ -608,6 +764,19 @@ def add2():
         # Find the largest gift idea ID
         largest_gift_idea_id = max((idea['gift_idea_id'] for idea in gift_ideas_data), default=0)
 
+
+        # Process custom fields from the form
+        custom_fields = {}
+        # Get all form keys that start with 'custom_field_key_'
+        for key in request.form.keys():
+            if key.startswith('custom_field_key_'):
+                field_num = key.split('_')[-1]
+                field_key = request.form.get(f'custom_field_key_{field_num}', '').strip()
+                field_value = request.form.get(f'custom_field_value_{field_num}', '').strip()
+                
+                if field_key and field_value:  # Only add if both key and value are provided
+                    custom_fields[field_key] = field_value
+
         # Create a new idea object
         new_idea = {
             'user_id': user,
@@ -618,7 +787,9 @@ def add2():
             'value': value,
             'added_by': added_by,  # Track who added the idea
             'bought_by': None,  # Initialize as not bought
-            'image_path': image_path  # Store the image URL here
+            'image_path': image_path,  # Store the image URL here
+            'custom_fields': custom_fields,  # Add custom fields
+            'last_updated': datetime.now().isoformat()  # Set initial last_updated timestamp
         }
 
         # Append the new idea to the list
@@ -630,19 +801,12 @@ def add2():
         
         # Redirect to the user's gift ideas page
         return redirect(url_for('user_gift_ideas', selected_user_id=user))
-    imgenabled = os.getenv('IMGENABLED', 'true').lower() == 'true'
+    imgenabled = read_env_variable('IMGENABLED', 'true').lower() == 'true'
     # Render the "Add Idea" page with the filtered user list
     return render_template('add2.html', user_list=user_list, imgenabled=imgenabled)
 
-@app.route('/need_restart', methods=['GET'])
-def need_restart():
-    if os.getenv("SECRET_KEY") in [None, '']:
-        return render_template('restartneeded.html')
-    else:
-        return redirect(url_for('setup'))    
 
-
-@app.route('/add_idea/<selected_user_id>', methods=['GET', 'POST'])
+@app.route('/add_idea/<path:selected_user_id>', methods=['GET', 'POST'])
 @login_required
 def add_idea(selected_user_id):
     # Load data from JSON files
@@ -692,6 +856,19 @@ def add_idea(selected_user_id):
         # Find the largest gift idea ID
         largest_gift_idea_id = max((idea['gift_idea_id'] for idea in gift_ideas_data), default=0)
 
+        # Process custom fields from the form
+        custom_fields = {}
+        # Get all form keys that start with 'custom_field_key_'
+        for key in request.form.keys():
+            if key.startswith('custom_field_key_'):
+                field_num = key.split('_')[-1]
+                field_key = request.form.get(f'custom_field_key_{field_num}', '').strip()
+                field_value = request.form.get(f'custom_field_value_{field_num}', '').strip()
+                
+                if field_key and field_value:  # Only add if both key and value are provided
+                    custom_fields[field_key] = field_value
+
+
         # Create a new idea object
         new_idea = {
             'user_id': user,
@@ -702,7 +879,9 @@ def add_idea(selected_user_id):
             'value': value,
             'added_by': added_by,  # Track who added the idea
             'bought_by': None,  # Initialize as not bought
-            'image_path': image_path  # Store the image URL here
+            'image_path': image_path,  # Store the image URL here
+            'custom_fields': custom_fields,  # Add custom fields
+            'last_updated': datetime.now().isoformat()  # Set initial last_updated timestamp
         }
 
         # Append the new idea to the list
@@ -714,7 +893,7 @@ def add_idea(selected_user_id):
         # Flash success message and redirect
         flash(f'Idea "{name}" added for user {user} by {added_by}!', 'success')
         return redirect(url_for('user_gift_ideas', selected_user_id=user))
-    imgenabled = os.getenv('IMGENABLED', 'true').lower() == 'true'
+    imgenabled = read_env_variable('IMGENABLED', 'true').lower() == 'true'
     # Render the "Add Idea" page with the user list, gift ideas, and the selected user as default
     return render_template('add_idea.html', user_list=user_list, gift_ideas=gift_ideas_data, default_user=selected_user_id, imgenabled=imgenabled)
 
@@ -724,15 +903,20 @@ def add_idea(selected_user_id):
 def delete_idea(idea_id):
     # Load gift ideas using helper function
     gift_ideas_data = load_gift_ideas()
+    users = load_users()
+    
 
     # Find the idea by its ID
     idea = find_idea_by_id(gift_ideas_data, idea_id)
+    shared_list = next((user for user in users if user['username'] == idea['user_id'] and user.get('shared_list')), None)
 
     if idea:
         current_user_username = session['username']  # Use 'username' from the session
 
+# Check if the idea was added by the current user, if it's in their list, OR if they're a member of the shared list
+
         # Check if the idea was added by the current user or if it's in their list
-        if idea['added_by'] == current_user_username or idea['user_id'] == current_user_username:
+        if idea['added_by'] == current_user_username or idea['user_id'] == current_user_username or (shared_list and current_user_username in shared_list.get('list_members', [])):
             # Check if the idea is bought
             if idea['bought_by']:
                 # Send an email to the buyer using Mailjet
@@ -761,6 +945,9 @@ def get_user_email_by_username(username):
     return user.get('email') if user else None
 
 def send_email_to_buyer_via_mailjet(buyer_username, idea_name, message_subject):
+    if not read_env_variable("MAILJET_API_KEY") or not read_env_variable("MAILJET_API_SECRET"):
+        print("Mailjet not configured. Skipping email notification.")
+        return True  # Return True to allow deletion to proceed
     # Find the idea bought by the buyer
     gift_ideas_data = load_gift_ideas()
     for idea in gift_ideas_data:
@@ -775,7 +962,7 @@ def send_email_to_buyer_via_mailjet(buyer_username, idea_name, message_subject):
                     'Messages': [
                         {
                             'From': {
-                                'Email': os.getenv("SYSTEM_EMAIL"),  # Your sender email address
+                                'Email': read_env_variable("SYSTEM_EMAIL"),  # Your sender email address
                                 'Name': 'GiftManager',
                             },
                             'To': [
@@ -829,6 +1016,12 @@ def dashboard():
     
     # Initialize visible_users
     visible_users = []
+
+    # Initialize groups, that current user is a member of (to be filled down below)
+    member_groups = []
+    
+    # Get boolean setting from user, if the dashboard should show the users grouped
+    show_groups = (current_user.get('dashboard_user_grouping', 'false') == 'true')
     
     if is_guest:
         # Handle guest user access
@@ -850,36 +1043,110 @@ def dashboard():
                 if user['username'] in access_users and not user.get('guest')
             ]
     else:
-        # Regular user logic - SIMPLE VERSION
+        # Regular user logic
         current_user_groups = current_user.get('groups', [])
         
         # If current user has no groups, show all non-guest users
         if not current_user_groups:
             visible_users = [user for user in users if not user.get('guest')]
+            
+            if show_groups:
+                # Get ALL groups from ALL users
+                all_groups = set()
+                for user in visible_users:
+                    all_groups.update(user.get('groups', []))
+                
+                # Create groups current user appears in ALL groups
+                member_groups = []
+                
+                for group in all_groups:
+                    # Get users who belong to this group
+                    group_members = [user for user in visible_users if group in user.get('groups', [])]
+                    
+                    # Add current user to EVERY group
+                    if current_user not in group_members:
+                        group_members.append(current_user)
+                    
+                    if group_members:
+                        member_groups.append({
+                            "name": group,
+                            "members": group_members
+                        })
         else:
-            # If current user has groups, show users who share groups OR have no groups
-            visible_users = [
-                user for user in users
-                if (not user.get('groups') or any(group in current_user_groups for group in user.get('groups', [])))
-                and not user.get('guest')
-            ]
+            if show_groups:
+                # First, get all users who should be visible (same logic as when show_groups=False)
+                visible_users = [
+                    user for user in users
+                    if (not user.get('groups') or any(group in current_user_groups for group in user.get('groups', [])))
+                    and not user.get('guest')
+                ]
+                
+                # Now create groups users with no groups should appear in ALL groups
+                member_groups = []
+                
+                for group in current_user_groups:
+                    # Get users who belong to this specific group
+                    group_members = []
+                    
+                    for user in visible_users:
+                        user_groups = user.get('groups', [])
+                        
+                        # User belongs to this group if:
+                        # 1. They have this group in their groups list, OR
+                        # 2. They have no groups at all (appear in all groups)
+                        if group in user_groups or not user_groups:
+                            group_members.append(user)
+                    
+                    if group_members:  # Only add group if it has members
+                        member_groups.append({
+                            "name": group,
+                            "members": group_members
+                        })
+                    
+            else:
+                # If current user has groups but does not want grouping on the dashboard
+                # Show users who share groups OR have no groups
+                visible_users = [
+                    user for user in users
+                    if (not user.get('groups') or any(group in current_user_groups for group in user.get('groups', [])))
+                    and not user.get('guest')
+                ]
         
         # Move current user to top
-        if current_user in visible_users:
-            visible_users.insert(0, visible_users.pop(visible_users.index(current_user)))
+        if show_groups:
+            # Find which group(s) contain the current user and move to top in each
+            for group in member_groups:
+                group['members'].insert(0, group['members'].pop(group['members'].index(current_user)))
+        else:
+            if current_user in visible_users:
+                visible_users.insert(0, visible_users.pop(visible_users.index(current_user)))
 
     # Sort the users alphabetically by full name
-    sorted_users = sorted(visible_users, key=lambda x: x['full_name'].lower())
+    if show_groups:
+        # Set sorted_users to empty, since we don't need them with the grouping
+        sorted_users = []
+        for group in member_groups:
+            group['members'] = sorted(
+                    group['members'],
+                    key=lambda x: (x['username'] != current_user['username'], x['full_name'].lower())
+                )
+    else:
+        sorted_users = sorted(
+                visible_users,
+                key=lambda x: (x['username'] != current_user['username'], x['full_name'].lower())
+            )
+
 
     # Prepare the profile information for the current user
     profile_info = {
         'full_name': current_user.get('full_name'),
         'birthday': current_user.get('birthday'),
         'admin': current_user.get('admin'),
-        'guest': is_guest
+        'guest': is_guest,
+        'avatar': current_user.get('avatar', None)
     }
 
-    app_version = "v2.4.5"
+    app_version = "v2.8.0"
     
     # Get assigned users if available in the current user's data
     assigned_users = current_user.get('assigned_users', None)
@@ -887,14 +1154,20 @@ def dashboard():
     # Get flash messages related to passwords
     password_messages = [msg for msg in get_flashed_messages() if 'password' in msg.lower() or 'email' in msg.lower()]
 
+    enable_link_sharing_value = read_env_variable("ENABLE_LINK_SHARING", "true")
+    enable_link_sharing = str(enable_link_sharing_value).lower() == 'true' if enable_link_sharing_value is not None else True
+
     # Render the dashboard page with the necessary context
     return render_template(
         'dashboard.html',
         profile_info=profile_info,
+        show_groups=show_groups,
         users=sorted_users,
+        groups=member_groups,
         password_messages=password_messages,
         app_version=app_version,
-        assigned_users=assigned_users
+        assigned_users=assigned_users,
+        enable_link_sharing=enable_link_sharing
     )
 
 
@@ -958,18 +1231,26 @@ def mark_as_bought(idea_id):
     # Find the idea by its ID
     idea = find_idea_by_id(gift_ideas_data, idea_id)
 
+    data = request.get_json()
+    hide_purchaser = read_env_variable('HIDE_PURCHASER', 'false').lower() == 'true'
+    bought_anonymously = True if 'anonymous' in data.keys() and data['anonymous'] else False
+
     if idea:
         if not idea['bought_by']:
             # Mark the idea as bought by the current user
             idea['bought_by'] = session['username']
             idea['date_bought'] = datetime.now().strftime('%Y-%m-%d %H:%M:%S')  # Record the current date and time
+            idea['bought_anonymously'] = bought_anonymously
             flash(f'Marked "{idea["gift_name"]}" as bought!', 'success')
 
             # Save the updated gift ideas back to the JSON file
             save_gift_ideas(gift_ideas_data)  # Save the updated list
         else:
             # If already bought, display a warning
-            flash(f'"{idea["gift_name"]}" has already been bought by {idea["bought_by"]}.', 'warning')
+            if hide_purchaser or bought_anonymously:
+                flash(f'"{idea["gift_name"]}" has already been bought by an anonymous user.', 'warning')
+            else:    
+                flash(f'"{idea["gift_name"]}" has already been bought by {idea["bought_by"]}.', 'warning')
     else:
         flash('Idea not found', 'danger')
 
@@ -1031,7 +1312,7 @@ def get_full_name(username):
     return username  # If no match found, return the username itself
 
 
-@app.route('/user_gift_ideas/<selected_user_id>')
+@app.route('/user_gift_ideas/<path:selected_user_id>')
 @login_required
 @guest_allowed
 def user_gift_ideas(selected_user_id):
@@ -1052,11 +1333,34 @@ def user_gift_ideas(selected_user_id):
     if not user_gift_ideas:
         flash('No gift ideas for this user.', 'info')
         return redirect(url_for('noidea'))
+    
+    imgenabled = read_env_variable('IMGENABLED', 'true').lower() == 'true'
+    hide_purchaser = read_env_variable('HIDE_PURCHASER', 'user_choice')
 
+    # Ensure each idea has custom_fields and last_updated fields for template
+    for idea in user_gift_ideas:
+        if 'custom_fields' not in idea:
+            idea['custom_fields'] = {}
+        # Replace bought_by if bought anonymously or globally hiding purchaser, for not leaking the info, but not for items bought by current user
+        if ('bought_by' in idea and
+            idea['bought_by'] and 
+            idea['bought_by'] != connected_user and
+            (('bought_anonymously' in idea and 
+                idea['bought_anonymously'] == True ) or
+            hide_purchaser)):
+            idea['bought_by'] = "Anonymous"
+
+    users = load_users()
+    shared_list = next((user for user in users if user['username'] == selected_user_id and user.get('shared_list')), None)
+    is_shared_list_member = shared_list and connected_user in shared_list.get('list_members', [])
     # Call get_full_name function to fetch the user's full name directly in the route
     user_namels = get_full_name(selected_user_id)  # Get the full name based on the selected user ID
-    imgenabled = os.getenv('IMGENABLED', 'true').lower() == 'true'
-    return render_template('user_gift_ideas.html', user_gift_ideas=user_gift_ideas, user_namels=user_namels, imgenabled=imgenabled)
+    return render_template('user_gift_ideas.html',
+        user_gift_ideas=user_gift_ideas,
+        user_namels=user_namels,
+        imgenabled=imgenabled,
+        hide_purchaser=hide_purchaser,
+        is_shared_list_member=is_shared_list_member)
 
 
 @app.route('/my_ideas')
@@ -1074,12 +1378,16 @@ def my_ideas():
     # Sort the gift ideas by priority, with ideas that have no priority appearing at the bottom
     my_gift_ideas.sort(key=lambda x: (x.get('priority', float('inf')), x['gift_idea_id']))
 
-    reordering = os.getenv('REORDERING', 'true').lower() == 'true'
-    imgenabled = os.getenv('IMGENABLED', 'true').lower() == 'true'
+    reordering = read_env_variable('REORDERING', 'true').lower() == 'true'
+    imgenabled = read_env_variable('IMGENABLED', 'true').lower() == 'true'
     # Check if there are no ideas and redirect to a different page
     if not my_gift_ideas:
         flash('You haven\'t added any gift ideas.', 'info')
         return redirect(url_for('noidea'))
+    # Ensure each idea has custom_fields and last_updated fields for template
+    for idea in my_gift_ideas:
+        if 'custom_fields' not in idea:
+            idea['custom_fields'] = {}
 
     return render_template('my_ideas.html', my_gift_ideas=my_gift_ideas, reordering=reordering, imgenabled=imgenabled)
 
@@ -1088,7 +1396,7 @@ def my_ideas():
 def update_order():
     # Get the new order data from the request
     data = request.get_json()
-    new_order = data.get('order')  # Ensure 'order' includes 'priority'
+    new_order = data.get('order')
 
     # Load the gift ideas from the JSON file using load_gift_ideas()
     gift_ideas_data = load_gift_ideas()
@@ -1097,12 +1405,17 @@ def update_order():
     for idea in gift_ideas_data:
         for item in new_order:
             if int(idea['gift_idea_id']) == int(item['gift_idea_id']):
-                idea['priority'] = item['priority']  # Make sure priority is updated
+                priority = item.get('priority')
+                if priority is None or priority == '':
+                    # Remove the priority field completely from JSON
+                    if 'priority' in idea:
+                        del idea['priority']
+                else:
+                    idea['priority'] = priority
 
     # Write the updated data back to the JSON file using save_gift_ideas()
     save_gift_ideas(gift_ideas_data)
 
-    # Option 1: Return a success message as plain text
     return "Order updated successfully!"
 
 @app.route('/noidea')
@@ -1110,6 +1423,173 @@ def update_order():
 @guest_allowed
 def noidea():
     return render_template('noideas.html')
+
+
+# Generate avatar
+def generate_random_avatar(filename=None):
+    def pick_random(enum_class):
+        return random.choice(list(enum_class))
+
+    human_eyes = [eye for eye in python_avatars.EyeType
+                  if not any(w in eye.name.upper() for w in 
+                             ['HEART', 'CRY', 'SIDE', 'X_DIZZY', 'STAR', 'CLOSED'])]
+
+    age_group = random.choice(["child", "adult"])
+    gender_expression = random.choice(["feminine", "masculine", "neutral"])
+    facial_hair = python_avatars.FacialHairType.NONE if age_group=="child" or gender_expression=="feminine" else pick_random(python_avatars.FacialHairType)
+
+    avatar = python_avatars.Avatar(
+        style=python_avatars.AvatarStyle.CIRCLE,
+        background_color=python_avatars.BackgroundColor.DEFAULT,
+        accessory=python_avatars.AccessoryType.NONE,
+        top=pick_random(python_avatars.HairType),
+        hair_color=pick_random(python_avatars.HairColor),
+        skin_color=pick_random(python_avatars.SkinColor),
+        eyes=random.choice(human_eyes) if human_eyes else pick_random(python_avatars.EyeType),
+        eyebrows=pick_random(python_avatars.EyebrowType),
+        facial_hair=facial_hair,
+        clothing=pick_random(python_avatars.ClothingType),
+        clothing_color=pick_random(python_avatars.ClothingColor),
+    )
+
+    if filename is None:
+        filename = f"{datetime.now().timestamp()}.svg"
+    path = Path(app.config['AVATAR_DIR'], filename)
+    avatar.render(path)
+    return filename
+
+# Cleanup unused avatars
+def cleanup_unused_avatars(users):
+    """Delete only unused SVG avatars, never delete PNGs"""
+    avatar_dir = Path(app.config['AVATAR_DIR'])
+    assigned_avatars = set(u.get('avatar') for u in users if u.get('avatar'))
+
+    for file_path in avatar_dir.iterdir():
+        if not file_path.is_file():
+            continue
+
+        # Skip PNGs entirely
+        if file_path.suffix.lower() == '.png':
+            continue
+
+        # Only delete if not assigned to any user
+        if file_path.name not in assigned_avatars:
+            try:
+                os.remove(file_path)
+            except Exception as e:
+                print(f"[cleanup_unused_avatars] Error deleting {file_path.name}: {e}")
+
+# Generate avatar route
+@app.route('/generate_avatar', methods=['GET'])
+@login_required
+def generate_avatar():
+    username = session['username']
+    avatar_dir = Path(app.config['AVATAR_DIR'])
+
+    # Generate unique filename (timestamp + random string)
+    filename = f"{datetime.now().timestamp()}.svg"
+    path = avatar_dir / filename
+
+    # Generate avatar
+    generate_random_avatar(filename)
+
+    # Cleanup unassigned avatars
+    users = load_users()
+    assigned_avatars = {u.get('avatar') for u in users if u.get('avatar')}
+
+    for file_path in avatar_dir.iterdir():
+        if not file_path.is_file():
+            continue
+
+        if file_path.suffix.lower() == '.png':
+            continue  # never delete PNGs
+
+        # Keep the avatar we just generated
+        if file_path.name == filename:
+            continue
+
+        # Delete if not assigned
+        if file_path.name not in assigned_avatars:
+            try:
+                file_path.unlink()
+            except Exception as e:
+                print(f"[generate_avatar] Error deleting {file_path.name}: {e}")
+
+    return jsonify({"filename": filename})
+
+
+# Change avatar route
+@app.route('/change_avatar', methods=['POST'])
+@login_required
+def change_avatar():
+    users = load_users()
+    user = next((u for u in users if u['username'] == session['username']), None)
+    if not user:
+        flash('User not found', 'danger')
+        return redirect(url_for('login'))
+
+    avatar = request.form.get('avatar')
+
+    # Handle uploaded avatar
+    if 'new_avatar' in request.files and request.files['new_avatar'].filename:
+        file = request.files['new_avatar']
+        
+        # Get the original file extension from the uploaded file
+        if '.' in file.filename:
+            file_extension = file.filename.rsplit('.', 1)[1].lower()
+        else:
+            # No extension provided, default to png
+            file_extension = 'png'
+            file.filename = f"{file.filename}.png"
+        
+        # Create filename with timestamp and original extension
+        filename = f"{datetime.now().timestamp()}.{file_extension}"
+        
+        # Try to open and process with PIL if it's a supported format
+        try:
+            img = Image.open(file)
+            img.thumbnail((512, 512), Image.Resampling.LANCZOS)
+            
+            # Determine the format from the extension
+            # Map common extensions to PIL format codes
+            format_map = {
+                'png': 'PNG',
+                'jpg': 'JPEG',
+                'jpeg': 'JPEG',
+                'gif': 'GIF',
+                'bmp': 'BMP',
+                'tiff': 'TIFF',
+                'tif': 'TIFF',
+                'webp': 'WEBP'
+            }
+            
+            # Get format or default to PNG
+            img_format = format_map.get(file_extension, 'PNG')
+            
+            # Save in the original format
+            img.save(Path(app.config['AVATAR_DIR'], filename), img_format)
+            
+        except Exception as e:
+            file.seek(0)  # Reset file pointer
+            file.save(Path(app.config['AVATAR_DIR'], filename))
+        
+        avatar = filename
+
+    # Validate file exists
+    avatar_path = Path(app.config['AVATAR_DIR'], avatar)
+    if not avatar or not avatar_path.is_file():
+        flash('Avatar file not found!', 'danger')
+        return redirect(url_for('dashboard'))
+
+    user['avatar'] = avatar
+    save_users(users)
+
+    # Cleanup unused avatars
+    cleanup_unused_avatars(users)
+
+    return redirect(url_for('dashboard'))
+
+
 
 @app.route('/add_user', methods=['GET', 'POST'])
 @admin_required
@@ -1125,6 +1605,21 @@ def add_user():
         birthday = request.form['birthday']
         email = request.form.get('email')  # Optional field
         avatar = request.form.get('avatar')
+
+        # If a new avatar image was uploaded, save it
+        if 'new_avatar' in request.files and request.files['new_avatar'].filename == avatar:
+            file = request.files['new_avatar']
+            # Sanitize filename and prepend the unix epoch
+            filename = str(datetime.now().timestamp()) + ".png"
+            avatar = filename
+            image = Image.open(file)
+            image.thumbnail((512, 512), Image.Resampling.LANCZOS)
+            image.save(Path(app.config['AVATAR_DIR'], filename), "PNG")
+        else:
+            # User has chosen a randomly generated avatar
+            if avatar and not os.path.isfile(Path(app.config['AVATAR_DIR'], avatar)):
+                flash('Generated user avatar timed out and was deleted! Try again to add the new user.', 'error')
+                return redirect(url_for('add_user'))
 
         # Hash the password
         hashed = password_hash(password)
@@ -1142,7 +1637,7 @@ def add_user():
             "birthday": birthday,
             "admin": False,
             "email": email if email else "",
-            "avatar": avatar if avatar else "",
+            "avatar": avatar if avatar else "default.svg",  # Always set a default
             "groups": []  # New user starts with no groups
         }
 
@@ -1153,9 +1648,13 @@ def add_user():
         save_users(users)  # Using save_users function to write the users to file
 
         flash('User added successfully!', 'success')
-        return redirect(url_for('admin_dashboard'))
-
-    return render_template('add_user.html')
+        return redirect(url_for('manage_users'))
+    
+    # For GET request, generate an avatar preview
+    # We need a version that doesn't delete any user's avatar since no one is logged in
+    filename = generate_random_avatar()
+    
+    return render_template('add_user.html', avatar=filename)
 
 
 @app.route('/edit_idea/<int:idea_id>', methods=['GET', 'POST'])
@@ -1163,20 +1662,20 @@ def add_user():
 def edit_idea(idea_id):
     # Load the gift ideas from the JSON file
     gift_ideas_data = load_gift_ideas()
-
+# Check if the idea was added by the current user, if it's in their list, OR if they're a member of the shared list
+    users = load_users()
+    
     # Find the idea by its ID
     idea = find_idea_by_id(gift_ideas_data, idea_id)
+
+    shared_list = next((user for user in users if user['username'] == idea['user_id'] and user.get('shared_list')), None)
 
     if idea:
         current_user_username = session['username']  # Use 'username' from the session
 
         # Check if the idea was added by the current user or if it's in their list
-        if idea['added_by'] == current_user_username or idea['user_id'] == current_user_username:
+        if idea['added_by'] == current_user_username or idea['user_id'] == current_user_username or (shared_list and current_user_username in shared_list.get('list_members', [])):
             if request.method == 'POST':
-                # Debug: print received form data
-                print(f"Received description: {request.form.get('description')}")
-                print(f"Received link: {request.form.get('link')}")
-                print(f"Received image_path: {request.form.get('image_path')}")  # This is the field for the image path
 
                 # Update idea details with submitted form data
                 idea['description'] = request.form.get('description', '')
@@ -1190,13 +1689,53 @@ def edit_idea(idea_id):
                 else:
                     print("No image path provided.")
 
+                # Process custom fields (handle optional)
+                custom_fields = {}
+                
+                # Track which existing fields should be kept
+                existing_keys_to_keep = []
+                
+                # Get all field indices from the form
+                for key in request.form.keys():
+                    if key.startswith('existing_custom_key_'):
+                        field_id = key.split('_')[-1]
+                        existing_keys_to_keep.append(field_id)
+                
+                # Process only the existing fields that are still in the form
+                for field_id in existing_keys_to_keep:
+                    field_key = request.form.get(f'existing_custom_key_{field_id}', '').strip()
+                    field_value = request.form.get(f'existing_custom_value_{field_id}', '').strip()
+                    
+                    if field_key:  # Only add if key exists (even if value is empty)
+                        custom_fields[field_key] = field_value
+                
+                # Handle new custom fields
+                new_field_count = 0
+                for key in request.form.keys():
+                    if key.startswith('new_custom_field_key_'):
+                        field_num = key.split('_')[-1]
+                        field_key = request.form.get(f'new_custom_field_key_{field_num}', '').strip()
+                        field_value = request.form.get(f'new_custom_field_value_{field_num}', '').strip()
+                        
+                        if field_key:  # Only add if key exists
+                            custom_fields[field_key] = field_value
+                            new_field_count += 1
+                
+                # Update custom fields (this will remove any deleted fields)
+                idea['custom_fields'] = custom_fields
+                
+                # Update last_updated timestamp
+                idea['last_updated'] = datetime.now().isoformat()
+                
                 # Save the updated gift ideas data back to the JSON file
                 save_gift_ideas(gift_ideas_data)
 
                 flash('Idea updated successfully!', 'success')
                 return redirect(url_for('user_gift_ideas', selected_user_id=idea['user_id']))
             
-            imgenabled = os.getenv('IMGENABLED', 'true').lower() == 'true'
+            imgenabled = read_env_variable('IMGENABLED', 'true').lower() == 'true'
+            if 'custom_fields' not in idea:
+                idea['custom_fields'] = {}
             # Render the edit idea form with pre-filled data
             return render_template('edit_idea.html', idea=idea, imgenabled=imgenabled)
         else:
@@ -1219,86 +1758,220 @@ def verify_password(hash, password):
         return False
 
 
+def is_valid_pool_name(name):
+    return bool(re.match(r'^[a-zA-Z0-9_-]+$', name))
+
+def create_secret_santa_assignments(participants, exclusions):
+
+  #  Returns (assignments, error_message) or (None, error) if impossible.
+
+    participants = list(participants)
+    
+    # Build bidirectional exclusion set
+    excluded = set()
+    for pair in exclusions:
+        if '-' in pair:
+            a, b = pair.split('-')[:2]
+            a, b = a.strip(), b.strip()
+            if a and b and a in participants and b in participants:
+                excluded.add((a, b))
+                excluded.add((b, a))
+    
+    # Quick feasibility check
+    for person in participants:
+        possible = [p for p in participants 
+                   if p != person and (person, p) not in excluded]
+        if not possible:
+            person = get_full_name(person)
+            return None, f"{person} has no possible recipients"
+    
+    # Try to find valid assignments (maximum 50,000 attempts)
+    for attempt in range(50000):
+        # Shuffle and create circular assignment
+        receivers = participants[:]
+        random.shuffle(receivers)
+        
+        # Check if this permutation works
+        assignments = {}
+        valid = True
+        
+        for giver, receiver in zip(participants, receivers):
+            # No self-gifting and no excluded pairs
+            if giver == receiver or (giver, receiver) in excluded:
+                valid = False
+                break
+            assignments[giver] = receiver
+        
+        # If valid and everyone has unique assignments
+        if valid and len(set(assignments.values())) == len(participants):
+            # Final verification
+            for giver, receiver in assignments.items():
+                if (giver, receiver) in excluded:
+                    return None, f"Unexpected exclusion violation: {giver} → {receiver}"
+            return assignments, None
+    
+    return None, "Could not find valid assignments after many attempts"
+
 @app.route('/secret_santa', methods=['GET', 'POST'])
 @admin_required
 @login_required
 def secret_santa():
-    # Load users from the JSON file
     users = load_users()
-
+    
     # Get existing pools
     existing_pools = set()
     for user in users:
         if 'assigned_users' in user:
             existing_pools.update(user['assigned_users'].keys())
-
+    
     if request.method == 'POST':
-        pool_name_to_delete = request.form.get('pool_name_to_delete')
-
-        if pool_name_to_delete:
-            # Handle deleting a specific pool
-            pool_exists = False
+        # Handle deletion
+        if 'pool_name_to_delete' in request.form:
+            pool_name = request.form['pool_name_to_delete']
+            
+            if not is_valid_pool_name(pool_name):
+                flash('Invalid pool name', 'error')
+                return redirect(url_for('secret_santa'))
+            
+            deleted = False
             for user in users:
-                if 'assigned_users' in user and pool_name_to_delete in user['assigned_users']:
-                    pool_exists = True
-                    del user['assigned_users'][pool_name_to_delete]
-
-            if not pool_exists:
-                flash(f'Pool "{pool_name_to_delete}" does not exist.', 'error')
-            else:
-                # Remove the corresponding instructions file if it exists
-                try:
-                    os.remove(f'santa_inst_{pool_name_to_delete}.txt')
-                except FileNotFoundError:
-                    pass  # Ignore if the file does not exist
-
-                # Save the updated users list
+                if 'assigned_users' in user and pool_name in user['assigned_users']:
+                    del user['assigned_users'][pool_name]
+                    deleted = True
+            
+            if deleted:
+                os.remove(Path(app.config['DATA'], f'santa_inst_{pool_name}.txt'))
                 save_users(users)
-                flash(f'Pool "{pool_name_to_delete}" has been deleted!', 'success')
+                flash(f'Pool "{pool_name}" deleted', 'success')
+            else:
+                flash(f'Pool "{pool_name}" not found', 'error')
+            
+            return redirect(url_for('secret_santa'))
+        
+        # CREATE NEW POOL
+        pool_name = request.form.get('pool_name', '').strip()
+        participants = request.form.getlist('participants')
+        instructions = request.form.get('instructions', '')
+        
+        # Parse exclusions from JSON (sent by frontend)
+        exclusions = []
+        exclusions_json = request.form.get('all_exclusions', '[]')
+        try:
+            exclusions = json.loads(exclusions_json)
+        except:
+            # Fallback: try to parse from form fields
+            for key, value in request.form.items():
+                if key.startswith('exclusion_giver_'):
+                    pair_num = key.replace('exclusion_giver_', '')
+                    receiver_key = f'exclusion_receiver_{pair_num}'
+                    if receiver_key in request.form:
+                        giver = value.strip()
+                        receiver = request.form[receiver_key].strip()
+                        if giver and receiver and giver != receiver:
+                            exclusions.append(f"{giver}-{receiver}")
+        
+        # Validation - store errors to show on page
+        errors = []
+        
+        if not pool_name:
+            errors.append('Pool name required')
+        
+        if pool_name and not is_valid_pool_name(pool_name):
+            errors.append('Invalid pool name (letters, numbers, dashes, underscores only)')
+        
+        if len(participants) < 2:
+            errors.append('Need at least 2 participants')
+        
+        if len(set(participants)) != len(participants):
+            errors.append('Duplicate participants selected')
+        
+        # If basic validation errors, show them on the page
+        if errors:
+            return render_template('secret_santa.html', 
+                                 users=users, 
+                                 existing_pools=sorted(existing_pools),
+                                 form_data={
+                                     'pool_name': pool_name,
+                                     'participants': participants,
+                                     'instructions': instructions,
+                                     'exclusions': exclusions
+                                 },
+                                 errors=errors)
+        
+        # Create assignments
+        assignments, error = create_secret_santa_assignments(participants, exclusions)
+        
+        if assignments is None:
+            # Show error on the same page with form data preserved
+            return render_template('secret_santa.html',
+                                 users=users,
+                                 existing_pools=sorted(existing_pools),
+                                 form_data={
+                                     'pool_name': pool_name,
+                                     'participants': participants,
+                                     'instructions': instructions,
+                                     'exclusions': exclusions
+                                 },
+                                 errors=[f' {error}'])
 
-            return redirect(url_for('dashboard'))  # Redirect to dashboard after deletion
-
-        else:
-            # Handle creating Secret Santa assignments
-            selected_participants = request.form.getlist('participants')
-            secret_santa_instructions = request.form.get('instructions', '')  # Default to an empty string if not provided
-            pool_name = request.form.get('pool_name')
-
-            if not pool_name:
-                flash('Pool name is required!', 'error')
-                return redirect(url_for('secret_santa'))
-
-            if len(selected_participants) < 2:
-                flash('You need at least 2 participants for Secret Santa!', 'error')
-                return redirect(url_for('secret_santa'))
-
-            # Shuffle and assign participants
-            shuffled_participants = selected_participants[:]
-            random.shuffle(shuffled_participants)
-
-            assignments = {}
-            for i, participant in enumerate(shuffled_participants):
-                # Assign each participant the next one in the shuffled list, looping around
-                assignments[participant] = shuffled_participants[(i + 1) % len(shuffled_participants)]
-
-            # Save the assignments to the users JSON
+        
+        # Verify no exclusions are violated (double-check)
+        exclusion_violations = []
+        for exclusion in exclusions:
+            if '-' in exclusion:
+                a, b = exclusion.split('-')[:2]
+                a, b = a.strip(), b.strip()
+                if assignments.get(a) == b or assignments.get(b) == a:
+                    exclusion_violations.append(f'Assignment violates {a} ↔ {b}')
+        
+        if exclusion_violations:
+            return render_template('secret_santa.html',
+                                 users=users,
+                                 existing_pools=sorted(existing_pools),
+                                 form_data={
+                                     'pool_name': pool_name,
+                                     'participants': participants,
+                                     'instructions': instructions,
+                                     'exclusions': exclusions
+                                 },
+                                 errors=[f' Critical error: {exclusion_violations[0]}'])
+        
+        try:
+            # Save to users
             for user in users:
                 if user['username'] in assignments:
                     if 'assigned_users' not in user:
                         user['assigned_users'] = {}
                     user['assigned_users'][pool_name] = assignments[user['username']]
-
-            # Save the updated users data
+            
             save_users(users)
-
-            # Save the instructions to a text file specific to the pool
-            with open(f'santa_inst_{pool_name}.txt', 'w') as file:
-                file.write(secret_santa_instructions or '')  # Ensure it writes a string, even if empty
-
-            flash('Secret Santa assignments have been made!', 'success')
-            return redirect(url_for('secret_santa_assignments'))
-
-    return render_template('secret_santa.html', users=users, existing_pools=sorted(existing_pools))
+            
+            # Save instructions
+            with open(Path(app.config['DATA'], f'santa_inst_{pool_name}.txt'), 'w') as f:
+                f.write(instructions)
+            
+            flash(f' Pool "{pool_name}" created', 'success')
+            return redirect(url_for('secret_santa'))
+            
+        except Exception as e:
+            print(f"Error saving: {e}")
+            return render_template('secret_santa.html',
+                                 users=users,
+                                 existing_pools=sorted(existing_pools),
+                                 form_data={
+                                     'pool_name': pool_name,
+                                     'participants': participants,
+                                     'instructions': instructions,
+                                     'exclusions': exclusions
+                                 },
+                                 errors=[f' Error saving: {str(e)}'])
+    
+    # GET request - just show empty form
+    return render_template('secret_santa.html', 
+                         users=users, 
+                         existing_pools=sorted(existing_pools),
+                         form_data={},
+                         errors=[])
 
 
 @app.route('/secret_santa_assignments', methods=['GET'])
@@ -1323,7 +1996,7 @@ def secret_santa_assignments():
     pool_instructions = {}
     for pool_name in assigned_users.keys():
         try:
-            with open(f'santa_inst_{pool_name}.txt', 'r') as file:
+            with open(Path(app.config['DATA'], f'santa_inst_{pool_name}.txt'), 'r') as file:
                 pool_instructions[pool_name] = file.read()
         except FileNotFoundError:
             pool_instructions[pool_name] = "No specific instructions provided."
@@ -1335,23 +2008,33 @@ def secret_santa_assignments():
 @app.route('/admin')
 @admin_required
 def admin_dashboard():
-    containerid = os.getenv("CONTAINER_ID")
-    container_restart = bool(containerid)
-    return render_template('admin_dashboard.html', container_restart=container_restart)
+    return render_template('admin_dashboard.html')
 
 @app.route('/users', methods=['GET', 'POST'])
 @admin_required
 def manage_users():
-
-    # Load users and filter out guests immediately
-    users = [user for user in load_users() if not user.get('guest', False)]
+    
+    # Load ALL users (including shared lists) for processing
+    all_users = load_users()
+    
+    # Filter only regular users for display/management
+    users = [user for user in all_users if not user.get('guest', False) and not user.get('shared_list', False)]
 
     if request.method == 'POST':
+        
         username = request.form.get('username')
-
+        
         # Handle delete
         if 'delete_user' in request.form:
-            users = [user for user in users if user['username'] != username]
+            # Remove only the regular user from both arrays
+            all_users = [user for user in all_users if user['username'] != username]
+            
+            # Remove user from list_members in shared lists
+            for user_obj in all_users:
+                if user_obj.get('shared_list') and 'list_members' in user_obj:
+                    if username in user_obj['list_members']:
+                        user_obj['list_members'].remove(username)
+            
             flash('User deleted successfully!', 'success')
 
         # Handle toggle admin
@@ -1359,6 +2042,10 @@ def manage_users():
             for user in users:
                 if user['username'] == username:
                     user['admin'] = bool(int(request.form['toggle_admin']))
+                    # Also update in all_users to maintain consistency
+                    for u in all_users:
+                        if u['username'] == username and not u.get('shared_list'):
+                            u['admin'] = bool(int(request.form['toggle_admin']))
                     flash('Admin status updated successfully!', 'success')
                     break
 
@@ -1368,127 +2055,146 @@ def manage_users():
             updated_email = request.form.get('email')
             updated_password = request.form.get('password')
             updated_avatar = request.form.get('avatar')
+            
+            
+            # Check if a new avatar file was uploaded
+            new_avatar_file = request.files.get('new_avatar')
+            
+            
+            if new_avatar_file and new_avatar_file.filename:
+                # A new file was uploaded
+                try:
+                    # Sanitize filename and prepend timestamp
+                    filename = f"{int(datetime.now().timestamp())}.png"
+                    updated_avatar = filename
+                    
+                    
+                    # Process and save the image
+                    image = Image.open(new_avatar_file)
+                    image.thumbnail((512, 512), Image.Resampling.LANCZOS)
+                    image.save(Path(app.config['AVATAR_DIR'], filename), "PNG")
+                    
+                    flash('Avatar uploaded successfully!', 'success')
+                except Exception as e:
+                    flash(f'Error uploading avatar: {str(e)}', 'error')
+                    return redirect(url_for('manage_users'))
+            else:
+                # No new file uploaded, but check if we're using a generated avatar
+                original_avatar = None
+                for user in users:
+                    if user['username'] == username:
+                        original_avatar = user.get('avatar', 'avatar1.png')
+                        break
+                                
+                # If avatar changed from original, check if the new one exists
+                if updated_avatar and updated_avatar != original_avatar:
+                    avatar_path = Path(app.config['AVATAR_DIR'], updated_avatar)
+                    file_exists = os.path.isfile(avatar_path)
+                    
+                    if not file_exists:
+                        flash('Generated avatar timed out and was deleted! Please generate a new one.', 'error')
+                        return redirect(url_for('manage_users'))
 
+            # Update user details
             for user in users:
                 if user['username'] == username:
+                    
                     user['full_name'] = updated_name
                     user['email'] = updated_email if updated_email else user.get('email', 'N/A')
-                    user['avatar'] = updated_avatar if updated_avatar else user.get('avatar', 'avatar1.png')  # Default avatar if missing
+                    user['avatar'] = updated_avatar if updated_avatar else user.get('avatar', 'avatar1.png')
                     if updated_password:
-                        user['password'] = ph.hash(updated_password)  # Hash the new password
+                        user['password'] = ph.hash(updated_password)
+                    
+                    
+                    # Also update in all_users
+                    for u in all_users:
+                        if u['username'] == username and not u.get('shared_list'):
+                            u.update(user)
+                    
                     flash('User updated successfully!', 'success')
                     break
+            
 
-        # Save updated users to the JSON file using the pre-defined function
-        save_users(users)
+        # Save ALL users (including shared lists) back to the file
+        save_users(all_users)
+        
+        # Reload for display
+        all_users = load_users()
+        users = [user for user in all_users if not user.get('guest', False) and not user.get('shared_list', False)]
 
     # Transform users into tuples for the template
     users_data = [
         (
             user['username'], 
             user['full_name'], 
-            user.get('email', 'N/A'),  # Default to 'N/A' if email is missing
-            user.get('avatar', 'avatar1.png'),  # Default to placeholder if avatar is missing
-            user.get('admin', 'N/A')  # Default to 'N/A' if admin is missing
+            user.get('email', 'N/A'),
+            user.get('avatar', 'avatar1.png'),
+            user.get('admin', 'N/A')
         )
         for user in users
     ]
 
-    return render_template('manage_users.html', users=users_data)
+    DEFAULT_AVATAR = "avatar1.png"
+    fixed_users = []
+
+    for user in users_data:
+        user = list(user)          # convert tuple → list if needed
+        if not user[3]:            # None, "", False
+            user[3] = DEFAULT_AVATAR
+        fixed_users.append(user)
+    
+
+
+    return render_template('manage_users.html', users=fixed_users)
 
 @app.route('/edit_email_settings', methods=['GET', 'POST'])
 @admin_required
 def edit_email_settings():
     if request.method == 'POST':
-        # Retrieve form values
-        mailjet_api_key = request.form.get('MAILJET_API_KEY', None)
-        mailjet_api_secret = request.form.get('MAILJET_API_SECRET', None)
         system_email = request.form.get('SYSTEM_EMAIL', None)
 
         try:
-            # Read current .env content
-            with open(dotenv_path, 'r') as file:
-                env_content = file.readlines()
-
-            # Update the variables in the .env file
-            new_env_content = []
-            for line in env_content:
-                key, _, value = line.partition('=')
-                key = key.strip()
-                if key == 'MAILJET_API_KEY' and mailjet_api_key:
-                    new_env_content.append(f"MAILJET_API_KEY='{mailjet_api_key}'\n")
-                elif key == 'MAILJET_API_SECRET' and mailjet_api_secret:
-                    new_env_content.append(f"MAILJET_API_SECRET='{mailjet_api_secret}'\n")
-                elif key == 'SYSTEM_EMAIL' and system_email:
-                    new_env_content.append(f"SYSTEM_EMAIL='{system_email}'\n")
-                else:
-                    new_env_content.append(line)
-
-            # Write updated content back to .env
-            with open(dotenv_path, 'w') as file:
-                file.writelines(new_env_content)
-
-            # Reload the .env file to reflect changes
-            load_dotenv(dotenv_path, override=True)
-
+            # Secrets go into os.environ in-process (takes effect immediately).
+            # Set them permanently in your Docker/systemd environment.
+            if mailjet_api_key:
+                os.environ["MAILJET_API_KEY"] = mailjet_api_key
+            if mailjet_api_secret:
+                os.environ["MAILJET_API_SECRET"] = mailjet_api_secret
+            # SYSTEM_EMAIL is a non-secret — saved to settings.json
+            if system_email:
+                save_setting("SYSTEM_EMAIL", system_email)
             flash("Email settings updated successfully!", "success")
         except Exception as e:
             flash(f"An error occurred: {e}", "danger")
         return redirect(url_for('edit_email_settings'))
 
-    # Reload the .env file before fetching current settings
-    load_dotenv(dotenv_path, override=True)  # Ensure we override old values
     current_settings = {
-        'MAILJET_API_KEY': '******',  # Mask sensitive values
-        'MAILJET_API_SECRET': '******',  # Mask sensitive values
-        'SYSTEM_EMAIL': os.getenv('SYSTEM_EMAIL', ''),
+        'SYSTEM_EMAIL': read_env_variable("SYSTEM_EMAIL", ""),
     }
     return render_template('edit_email_settings.html', settings=current_settings)
 
-def read_env_variable(key, dotenv_path=dotenv_path):
-    try:
-        with open(dotenv_path, 'r') as file:
-            for line in file:
-                if line.strip().startswith(f"{key}="):
-                    return line.strip().split('=', 1)[1].strip("'").strip('"')
-    except FileNotFoundError:
-        return None
-    return None
-
 @app.route('/edit_login_message', methods=['GET', 'POST'])
-@admin_required  # Assumes an @admin_required decorator exists for access control
+@admin_required
 def edit_login_message():
     if request.method == 'POST':
         new_message = request.form.get('login_message', '').strip()
         if new_message:
             try:
-                # Update the .env file
-                with open(dotenv_path, 'r') as file:
-                    lines = file.readlines()
-
-                with open(dotenv_path, 'w') as file:
-                    for line in lines:
-                        if line.strip().startswith("LOGIN_PAGE_MESSAGE="):
-                            file.write(f"LOGIN_PAGE_MESSAGE='{new_message}'\n")
-                        else:
-                            file.write(line)
-
+                save_setting("LOGIN_PAGE_MESSAGE", new_message)
                 flash("Login message updated successfully!", "success")
             except Exception as e:
                 flash(f"Error updating login message: {e}", "danger")
         else:
             flash("Message cannot be empty.", "danger")
-
         return redirect(url_for('edit_login_message'))
 
-    # Fetch the current login message directly from .env
     current_message = read_env_variable("LOGIN_PAGE_MESSAGE") or "No account? Contact a family member to create an account."
     return render_template('edit_login_message.html', current_message=current_message)
 
 def delete_old_gift_ideas():
 
     # Read the number of days from the environment variable
-    threshold_days = int(read_env_variable("DELETE_DAYS", dotenv_path) or 30)
+    threshold_days = int(read_env_variable("DELETE_DAYS", "30") or 30)
 
     # Calculate the threshold time
     threshold_time = datetime.now() - timedelta(days=threshold_days)
@@ -1532,7 +2238,7 @@ def delete_old_gift_ideas():
 @app.route('/delete_old_gift_ideas', methods=['GET', 'POST'])
 @admin_required
 def delete_old_gift_ideas_page():
-    current_days = read_env_variable("DELETE_DAYS", dotenv_path) or 30
+    current_days = read_env_variable("DELETE_DAYS", "30") or 30
     if request.method == 'POST':
         try:
             # Delete old gift ideas and get the count of deleted rows
@@ -1564,7 +2270,7 @@ def change_delete_days():
                 new_days = int(new_days)
 
                 # Update the .env file with the new value
-                set_key(dotenv_path, "DELETE_DAYS", str(new_days))  # Update the DELETE_DAYS value
+                save_setting("DELETE_DAYS", str(new_days))  # Update the DELETE_DAYS value
 
                 flash(f"The number of days to delete old gift ideas has been updated to {new_days}.", "success")
                 return redirect(url_for('change_delete_days'))
@@ -1575,8 +2281,7 @@ def change_delete_days():
             flash("Please provide a value for the number of days.", "danger")
 
     # Get the current value of the DELETE_OLD_GIFTS_DAYS from the .env file
-    current_days = read_env_variable("DELETE_DAYS", dotenv_path) or 30
-    
+    current_days = read_env_variable("DELETE_DAYS", "30") or 30
     return render_template('delete_old_gift_ideas.html', current_days=current_days)
 
 @app.route('/setupadmin', methods=['GET', 'POST'])
@@ -1596,7 +2301,6 @@ def setup():
         admin_email = request.form.get('admin_email')
         full_name = request.form.get('full_name')
         birthday = request.form.get('birthday')
-        avatar_url = request.form.get('avatar')  # Selected avatar from the dropdown
 
         # Hash the admin password
         admin_password_hash = ph.hash(admin_password)
@@ -1608,7 +2312,7 @@ def setup():
             "email": admin_email,
             "full_name": full_name,
             "birthday": birthday,
-            "avatar": avatar_url,
+            "avatar": "icons/avatar1.png",
             "admin": True
         }
 
@@ -1635,12 +2339,8 @@ def setupenv():
         # Collect form data
         delete_days = request.form.get('DELETE_DAYS', '30')  # Default to 30 days
         env_variables = {
-            "MAILJET_API_KEY": request.form.get('MAILJET_API_KEY', ''),
-            "MAILJET_API_SECRET": request.form.get('MAILJET_API_SECRET', ''),
             "SYSTEM_EMAIL": request.form.get('SYSTEM_EMAIL', ''),
             "DELETE_DAYS": delete_days,
-            "OIDC_CLIENT_ID": request.form.get('OIDC_CLIENT_ID', ''),
-            "OIDC_CLIENT_SECRET": request.form.get('OIDC_CLIENT_SECRET', ''),
             "OIDC_SERVER_METADATA_URL": request.form.get('OIDC_SERVER_METADATA_URL', ''),
             "OIDC_LOGOUT_URL": request.form.get('OIDC_LOGOUT_URL', ''),
             "PRIMARY_OIDC_FIELD": request.form.get('PRIMARY_OIDC_FIELD', 'email'),
@@ -1650,11 +2350,15 @@ def setupenv():
             "ENABLE_AUTO_REGISTRATION": request.form.get('ENABLE_AUTO_REGISTRATION', 'false'),
         }
 
-        # Save each variable to .env file
+        # Secrets → os.environ (in-process); non-secrets → settings.json
         for key, value in env_variables.items():
-            set_key(dotenv_path, key, value)
+            if key in _SECRET_KEYS:
+                if value:
+                    os.environ[key] = value
+            else:
+                save_setting(key, value)
 
-        flash('Environment variables saved successfully!', 'success')
+        flash('Settings saved successfully!', 'success')
         return redirect(url_for('index'))
 
     # Render the setup environment page
@@ -1666,8 +2370,6 @@ def setup_oidc():
     if request.method == 'POST':
         # Collect form data and validate required fields
         oidc_env_variables = {
-            "OIDC_CLIENT_ID": request.form.get("OIDC_CLIENT_ID", '').strip(),
-            "OIDC_CLIENT_SECRET": request.form.get("OIDC_CLIENT_SECRET", '').strip(),
             "OIDC_SERVER_METADATA_URL": request.form.get("OIDC_SERVER_METADATA_URL", '').strip(),
             "OIDC_LOGOUT_URL": request.form.get("OIDC_LOGOUT_URL", '').strip(),
             "PRIMARY_OIDC_FIELD": request.form.get("PRIMARY_OIDC_FIELD", 'email').strip(),
@@ -1678,61 +2380,42 @@ def setup_oidc():
             "ENABLE_DEFAULT_LOGIN": request.form.get("ENABLE_DEFAULT_LOGIN", 'true').strip(),
         }
 
-        # Check for missing fields
-        missing_fields = [key for key, value in oidc_env_variables.items() if not value]
+        # Check for missing fields — secrets OK if already in environment
+        missing_fields = [
+            key for key, value in oidc_env_variables.items()
+            if not value and not (key in _SECRET_KEYS and os.environ.get(key))
+        ]
         if missing_fields:
             flash(f"Missing required fields: {', '.join(missing_fields)}", 'danger')
             return render_template('setup_oidc.html', current_values=oidc_env_variables)
 
         try:
-            # Save each variable to the .env file
             for key, value in oidc_env_variables.items():
-                set_key(dotenv_path, key, value)
+                if key in _SECRET_KEYS:
+                    if value:
+                        os.environ[key] = value  # in-process only — set permanently in your env
+                else:
+                    save_setting(key, value)
 
             flash('OIDC settings saved successfully!', 'success')
-            return redirect(url_for('setup_oidc'))  # Redirect to home page after saving
+            return redirect(url_for('setup_oidc'))
         except Exception as e:
             flash(f"Error saving OIDC settings: {e}", "danger")
             return render_template('setup_oidc.html', current_values=oidc_env_variables)
 
-    # For GET requests, load the current values of OIDC-related environment variables
-    try:
-        # Load the .env file directly using the path
-        load_dotenv(dotenv_path, override=True)
-    except FileNotFoundError:
-        flash("Environment file not found. Creating a new one.", "warning")
-    
     current_values = {
-        "OIDC_CLIENT_ID": os.getenv("OIDC_CLIENT_ID", ''),
-        "OIDC_CLIENT_SECRET": os.getenv("OIDC_CLIENT_SECRET", ''),
-        "OIDC_SERVER_METADATA_URL": os.getenv("OIDC_SERVER_METADATA_URL", ''),
-        "OIDC_LOGOUT_URL": os.getenv("OIDC_LOGOUT_URL", ''),
-        "PRIMARY_OIDC_FIELD": os.getenv("PRIMARY_OIDC_FIELD", 'email'),
-        "SECONDARY_OIDC_FIELD": os.getenv("SECONDARY_OIDC_FIELD", 'preferred_username'),
-        "PRIMARY_DB_FIELD": os.getenv("PRIMARY_DB_FIELD", 'email'),
-        "SECONDARY_DB_FIELD": os.getenv("SECONDARY_DB_FIELD", 'username'),
-        "ENABLE_AUTO_REGISTRATION": os.getenv("ENABLE_AUTO_REGISTRATION", 'false'),
-        "ENABLE_DEFAULT_LOGIN": os.getenv("ENABLE_DEFAULT_LOGIN", 'true'),
+        "OIDC_SERVER_METADATA_URL": read_env_variable("OIDC_SERVER_METADATA_URL", ""),
+        "OIDC_LOGOUT_URL": read_env_variable("OIDC_LOGOUT_URL", ""),
+        "PRIMARY_OIDC_FIELD": read_env_variable("PRIMARY_OIDC_FIELD", "email"),
+        "SECONDARY_OIDC_FIELD": read_env_variable("SECONDARY_OIDC_FIELD", "preferred_username"),
+        "PRIMARY_DB_FIELD": read_env_variable("PRIMARY_DB_FIELD", "email"),
+        "SECONDARY_DB_FIELD": read_env_variable("SECONDARY_DB_FIELD", "username"),
+        "ENABLE_AUTO_REGISTRATION": read_env_variable("ENABLE_AUTO_REGISTRATION", "false"),
+        "ENABLE_DEFAULT_LOGIN": read_env_variable("ENABLE_DEFAULT_LOGIN", "true"),
     }
 
     return render_template('setup_oidc.html', current_values=current_values)
 
-@app.route('/restart_container', methods=['POST'])
-@admin_required
-def restart_container():
-    try:
-        container_id = os.getenv("CONTAINER_ID", "giftmanager")  # Set your container ID here
-        # Capture output and error for debugging
-        result = subprocess.run(['docker', 'restart', container_id], check=True, capture_output=True, text=True)
-    except subprocess.CalledProcessError as e:
-        print("Error details:", e.stderr)  # Detailed error info
-        flash("Failed to restart container. Please try again later.", "error")
-        return redirect(url_for('dashboard'))  # Redirect on error
-    except Exception as e:
-        print("General error:", str(e))
-        flash(f"An unexpected error occurred: {str(e)}", "error")
-        return redirect(url_for('dashboard'))  # Redirect on general error
-    
 # Families 
 # Start
 @app.route('/families', methods=['GET', 'POST'])
@@ -1796,32 +2479,46 @@ def update_group_assignments():
 @app.route('/setup_advanced', methods=['GET'])
 @admin_required
 def setup_advanced():
-    current_ID = read_env_variable("CONTAINER_ID")
+    hide_purchaser = read_env_variable("HIDE_PURCHASER", "user_choice")
     current_reorder = read_env_variable("REORDERING")
     images = read_env_variable("IMGENABLED")
     current_currency_symbol = get_currency_symbol()
     current_currency_position = get_currency_position()
-    enable_self_registration = os.getenv('ENABLE_SELF_REGISTRATION', 'false').lower() == 'true'
-    joining_code = os.getenv('JOINING_CODE', '')
-    return render_template('advanced.html', current_ID=current_ID, current_reorder=current_reorder, images=images, current_currency_symbol=current_currency_symbol,
-                         current_currency_position=current_currency_position, enable_self_registration=enable_self_registration,
-                         joining_code=joining_code)
+    enable_self_registration = read_env_variable("ENABLE_SELF_REGISTRATION", "false").lower() == 'true'
+    enable_link_sharing = read_env_variable("ENABLE_LINK_SHARING", "true").lower() == 'true'
+    joining_code = read_env_variable("JOINING_CODE", "")
+    
+    return render_template('advanced.html',
+                         hide_purchaser=hide_purchaser,
+                         current_reorder=current_reorder,
+                         images=images,
+                         current_currency_symbol=current_currency_symbol,
+                         current_currency_position=current_currency_position,
+                         enable_self_registration=enable_self_registration,
+                         joining_code=joining_code,
+                         enable_link_sharing=enable_link_sharing)
 
-# Route to update CONTAINER_ID (POST request)
-@app.route('/update_containerid', methods=['POST'])
+# Route to update HIDE_PURCHASER (POST request)
+@app.route('/hide_purchaser', methods=['POST'])
 @admin_required
-def update_containerid():
-    containerid = request.form.get('containerid', '').strip()
-    if containerid:
-        set_key(dotenv_path, "CONTAINER_ID", containerid)
+def update_hide_purchaser():
+    hide_purchaser_value = request.form.get('hide_purchaser', 'user_choice').strip()
+    
+    # Validate the input is one of our allowed values
+    allowed_values = ['global', 'disabled', 'user_choice']
+    if hide_purchaser_value not in allowed_values:
+        hide_purchaser_value = 'user_choice'  # Default fallback
+    
+    save_setting("HIDE_PURCHASER", hide_purchaser_value)
     return redirect(url_for('setup_advanced'))
+
 
 # Route to update REORDERING (POST request)
 @app.route('/update_reordering', methods=['POST'])
 @admin_required
 def update_reordering():
     reordering = request.form.get('reordering', 'true').strip()
-    set_key(dotenv_path, "REORDERING", reordering)
+    save_setting("REORDERING", reordering)
     return redirect(url_for('setup_advanced'))
 
 # Route to update IMGENABLED (POST request)
@@ -1829,7 +2526,7 @@ def update_reordering():
 @admin_required
 def update_images():
     images = request.form.get('images', 'true').strip()
-    set_key(dotenv_path, "IMGENABLED", images)
+    save_setting("IMGENABLED", images)
     return redirect(url_for('setup_advanced'))
 
 @app.route('/rundl')
@@ -1935,26 +2632,6 @@ def manage_guest_users():
             new_guest['groups'] = request.form.getlist('access_groups')
         else:  # people access
             new_guest['access_users'] = request.form.getlist('access_users')
-            
-            # Create private family groups for each selected person
-            private_groups = []
-            for selected_username in new_guest['access_users']:
-                # Create a unique private family name
-                private_family_name = f"guest_{username}_{selected_username}"
-                private_groups.append(private_family_name)
-                
-                # Add this private family to the guest user
-                if private_family_name not in new_guest['groups']:
-                    new_guest['groups'].append(private_family_name)
-                
-                # Add the private family to the selected user WITHOUT removing them from global access
-                for user in users:
-                    if user['username'] == selected_username:
-                        if 'groups' not in user:
-                            user['groups'] = []
-                        if private_family_name not in user['groups']:
-                            user['groups'].append(private_family_name)
-                        # User keeps their existing groups and remains in global access
         
         users.append(new_guest)
         save_users(users)
@@ -1979,7 +2656,7 @@ def manage_guest_users():
                          all_users=all_users)
 
 
-@app.route('/delete_guest_user/<username>', methods=['POST'])
+@app.route('/delete_guest_user/<path:username>', methods=['POST'])
 @admin_required
 def delete_guest_user(username):
     users = load_users()
@@ -1989,15 +2666,8 @@ def delete_guest_user(username):
     guest_user = next((user for user in users if user['username'] == username), None)
     
     if guest_user:
-        # 1. Remove ALL guest's private family groups from all users
-        for user in users:
-            if 'groups' in user:
-                # Remove any group that starts with "guest_{username}_"
-                user['groups'] = [group for group in user['groups'] 
-                                if not group.startswith(f"guest_{username}_")]
-                # Also remove the main guest family group if it exists
-                user['groups'] = [group for group in user['groups'] 
-                                if group != f"guest_{username}"]
+        # 1. Remove the guest user
+        users = [user for user in users if user['username'] != username]
         
         # 2. Delete entirely the gift ideas that were bought by this guest
         updated_gift_ideas = []
@@ -2010,14 +2680,11 @@ def delete_guest_user(username):
                 continue
             updated_gift_ideas.append(idea)
         
-        # 3. Remove the guest user
-        users = [user for user in users if user['username'] != username]
-        
         # Save both updated datasets
         save_users(users)
         save_gift_ideas(updated_gift_ideas)
         
-        flash(f'Guest user {username} deleted successfully! All private groups removed and {deleted_count} purchased gift ideas deleted.', 'success')
+        flash(f'Guest user {username} deleted successfully! {deleted_count} purchased gift ideas deleted.', 'success')
     else:
         flash('Guest user not found.', 'danger')
     
@@ -2056,8 +2723,8 @@ def update_currency_settings():
     symbol = request.form.get('currency_symbol', '$')
     position = request.form.get('currency_position', 'before')
     
-    set_key(dotenv_path, "CURRENCY_SYMBOL", symbol)
-    set_key(dotenv_path, "CURRENCY_POSITION", position)
+    save_setting("CURRENCY_SYMBOL", symbol)
+    save_setting("CURRENCY_POSITION", position)
     
     flash('Currency settings updated! Please restart to see changes', 'success')
     return redirect(url_for('setup_advanced'))
@@ -2069,11 +2736,448 @@ def update_self_registration_settings():
     enable_self_registration = request.form.get('enable_self_registration', 'false')
     joining_code = request.form.get('joining_code', '')
     
-    set_key(dotenv_path, "ENABLE_SELF_REGISTRATION", enable_self_registration)
-    set_key(dotenv_path, "JOINING_CODE", joining_code)
+    save_setting("ENABLE_SELF_REGISTRATION", enable_self_registration)
+    save_setting("JOINING_CODE", joining_code)
     
     flash('Self-registration settings updated successfully!', 'success')
     return redirect(url_for('setup_advanced'))
+
+@app.route('/manage_shared_lists', methods=['GET', 'POST'])
+@login_required
+def manage_shared_lists():
+    users = load_users()
+    
+    if request.method == 'POST':
+        # Handle creating new shared list
+        list_name = request.form['list_name']
+        members = request.form.getlist('members')
+        avatar = request.form.get('avatar', 'icons/avatar1.png')  # Default to avatar1
+        
+
+        sanitized_name = list_name.lower().replace(' ', '_')
+        # Remove characters that break URLs without using re
+        problematic_chars = ['/', '\\', '?', '#', '&', '=', '+']
+        for char in problematic_chars:
+            sanitized_name = sanitized_name.replace(char, '')
+        # Generate unique username for shared list
+        base_username = f"shared_{sanitized_name}"
+        username = base_username
+        counter = 1
+        
+        while any(user['username'] == username for user in users):
+            username = f"{base_username}_{counter}"
+            counter += 1
+        
+        # Create shared list user
+        shared_list_user = {
+            "username": username,
+            "full_name": list_name,
+            "admin": False,
+            "guest": False,
+            "shared_list": True,
+            "list_owner": session['username'],
+            "list_members": members + [session['username']],  # Include creator
+            "avatar": avatar  # Add the selected avatar
+        }
+        
+        users.append(shared_list_user)
+        save_users(users)
+        flash(f'Shared list "{list_name}" created successfully!', 'success')
+        return redirect(url_for('manage_shared_lists'))
+    
+    # Get available users for creating new lists
+    current_user_data = next((user for user in users if user["username"] == session['username']), None)
+    current_user_groups = current_user_data.get("groups", [])
+    
+    if not current_user_groups:
+        available_users = [user for user in users if not user.get('guest') and not user.get('shared_list')]
+    else:
+        available_users = [
+            user for user in users 
+            if (not user.get("groups") or any(group in current_user_groups for group in user.get("groups", [])))
+            and not user.get('guest') and not user.get('shared_list')
+        ]
+    
+    # Get existing shared lists for management
+    shared_lists = [
+        user for user in users 
+        if user.get('shared_list') and session['username'] in user.get('list_members', [])
+    ]
+    
+    return render_template('manage_shared_lists.html', 
+                         available_users=available_users, 
+                         shared_lists=shared_lists)
+
+# Keep the delete route separate
+@app.route('/delete_shared_list/<path:list_username>', methods=['POST'])
+@login_required
+def delete_shared_list(list_username):
+    users = load_users()
+    gift_ideas = load_gift_ideas()
+    
+    # Find the shared list
+    shared_list = next((user for user in users if user['username'] == list_username), None)
+    
+    if not shared_list:
+        flash('Shared list not found.', 'danger')
+        return redirect(url_for('manage_shared_lists'))
+    
+    # Check if current user is the owner
+    if shared_list.get('list_owner') != session['username']:
+        flash('Only the list owner can delete this shared list.', 'danger')
+        return redirect(url_for('manage_shared_lists'))
+    
+    # Remove shared list user
+    users = [user for user in users if user['username'] != list_username]
+    save_users(users)
+    
+    # Remove all ideas associated with this shared list
+    updated_gift_ideas = [idea for idea in gift_ideas if idea['user_id'] != list_username]
+    save_gift_ideas(updated_gift_ideas)
+    
+    flash(f'Shared list "{shared_list["full_name"]}" deleted successfully!', 'success')
+    return redirect(url_for('manage_shared_lists'))
+
+@app.route('/edit_shared_list_members/<path:list_username>', methods=['POST'])
+@login_required
+def edit_shared_list_members(list_username):
+    users = load_users()
+    
+    # Find the shared list
+    shared_list = next((user for user in users if user['username'] == list_username), None)
+    
+    if not shared_list:
+        flash('Shared list not found.', 'danger')
+        return redirect(url_for('manage_shared_lists'))
+    
+    # Check if current user is the owner
+    if shared_list.get('list_owner') != session['username']:
+        flash('Only the list owner can edit members.', 'danger')
+        return redirect(url_for('manage_shared_lists'))
+    
+    # Get selected members and always include the owner
+    new_members = request.form.getlist('members')
+    if session['username'] not in new_members:
+        new_members.append(session['username'])
+    
+    # Update the shared list members
+    shared_list['list_members'] = new_members
+    save_users(users)
+    
+    flash(f'Members updated for "{shared_list["full_name"]}"!', 'success')
+    return redirect(url_for('manage_shared_lists'))
+
+
+@app.route('/update_link_sharing', methods=['POST'])
+@admin_required
+def update_link_sharing():
+    """Update global link sharing setting"""
+    enable_link_sharing = request.form.get('enable_link_sharing', 'false').lower() == 'true'
+    
+    save_setting("ENABLE_LINK_SHARING", str(enable_link_sharing).lower())
+    
+    flash('Link sharing settings updated!', 'success')
+    return redirect(url_for('setup_advanced'))
+
+
+def generate_share_token():
+    return secrets.token_urlsafe(16)
+
+@app.route('/manage_sharing', methods=['GET', 'POST'])
+@login_required
+def manage_sharing():
+
+    if not read_env_variable('ENABLE_LINK_SHARING', 'true').lower() == 'true':
+        flash('Link sharing feature is currently disabled by administrator.', 'danger')
+        return redirect(url_for('dashboard'))
+
+
+    users = load_users()
+    current_user = next((user for user in users if user['username'] == session['username']), None)
+    
+    if not current_user:
+        flash('User not found', 'danger')
+        return redirect(url_for('dashboard'))
+    
+    # Get the target entity (user or shared list) for which we're managing sharing
+    target_username = request.args.get('for', session['username'])
+    target_entity = next((user for user in users if user['username'] == target_username), None)
+    
+    if not target_entity:
+        flash('Target not found', 'danger')
+        return redirect(url_for('dashboard'))
+    
+    # Check permissions
+    if target_entity.get('shared_list'):
+        # For shared lists, check if current user is a member
+        if session['username'] not in target_entity.get('list_members', []):
+            flash('You are not a member of this shared list', 'danger')
+            return redirect(url_for('dashboard'))
+    else:
+        # For individual users, only the user themselves can manage sharing
+        if target_username != session['username']:
+            flash('You can only manage your own sharing settings', 'danger')
+            return redirect(url_for('dashboard'))
+    
+    # Initialize sharing structure if it doesn't exist
+    if 'sharing' not in target_entity:
+        target_entity['sharing'] = {'public_links': []}
+    
+    if request.method == 'POST':
+        # Create new share link
+        if 'create_link' in request.form:
+            link_name = request.form.get('link_name', 'My Gift List')
+            days_valid = int(request.form.get('days_valid', 30))
+            allow_purchases = request.form.get('allow_purchases', 'false') == 'true'
+            
+            new_link = {
+                'token': generate_share_token(),
+                'created_at': datetime.now().strftime('%Y-%m-%d %H:%M:%S'),
+                'expires_at': (datetime.now() + timedelta(days=days_valid)).strftime('%Y-%m-%d %H:%M:%S'),
+                'is_active': True,
+                'name': link_name,
+                'created_by': session['username'],
+                'allow_purchases': allow_purchases,  # New field
+                'visitor_purchases': []  # Track visitor purchases
+            }
+            
+            target_entity['sharing']['public_links'].append(new_link)
+            save_users(users)
+            flash('New share link created!', 'success')
+        
+        # Toggle link status
+        elif 'toggle_link' in request.form:
+            token = request.form['token']
+            for link in target_entity['sharing']['public_links']:
+                if link['token'] == token:
+                    link['is_active'] = not link['is_active']
+                    save_users(users)
+                    status = "activated" if link['is_active'] else "deactivated"
+                    flash(f'Share link {status}!', 'success')
+                    break
+        
+        # Extend expiration date
+        elif 'extend_link' in request.form:
+            token = request.form['token']
+            additional_days = int(request.form.get('additional_days', 30))
+            
+            for link in target_entity['sharing']['public_links']:
+                if link['token'] == token:
+                    current_expiry = datetime.strptime(link['expires_at'], '%Y-%m-%d %H:%M:%S')
+                    new_expiry = current_expiry + timedelta(days=additional_days)
+                    link['expires_at'] = new_expiry.strftime('%Y-%m-%d %H:%M:%S')
+                    save_users(users)
+                    flash(f'Share link extended by {additional_days} days! New expiry: {new_expiry.strftime("%Y-%m-%d")}', 'success')
+                    break
+        
+        # Delete link
+        elif 'delete_link' in request.form:
+            token = request.form['token']
+            target_entity['sharing']['public_links'] = [
+                link for link in target_entity['sharing']['public_links'] 
+                if link['token'] != token
+            ]
+            save_users(users)
+            flash('Share link deleted!', 'success')
+    
+    # Get all shared lists where current user is a member (for navigation)
+    user_shared_lists = [
+        user for user in users 
+        if user.get('shared_list') and session['username'] in user.get('list_members', [])
+    ]
+    
+    return render_template('manage_sharing.html', 
+                         sharing_data=target_entity['sharing'],
+                         target_entity=target_entity,
+                         user_shared_lists=user_shared_lists,
+                         current_target=target_username,
+                         datetime=datetime)  # Add this line
+
+@app.route('/shared/<token>')
+def shared_list(token):
+
+
+    if not read_env_variable('ENABLE_LINK_SHARING', 'true').lower() == 'true':
+        return render_template('shared_list_expired.html'), 404
+
+
+    """Public view of a shared gift list or individual user list"""
+    users = load_users()
+    gift_ideas_data = load_gift_ideas()
+    
+    # Find the entity (user or shared list) that owns this share token
+    share_owner = None
+    active_link = None
+    is_expired = False
+    
+    for user in users:
+        if 'sharing' in user and 'public_links' in user['sharing']:
+            for link in user['sharing']['public_links']:
+                if link['token'] == token:
+                    # Check if link has expired
+                    expires_at = datetime.strptime(link['expires_at'], '%Y-%m-%d %H:%M:%S')
+                    if datetime.now() <= expires_at and link.get('is_active', True):
+                        share_owner = user
+                        active_link = link
+                    else:
+                        share_owner = user
+                        active_link = link
+                        is_expired = True
+                    break
+    
+    if not share_owner or not active_link:
+        return render_template('shared_list_expired.html'), 404
+    
+    if is_expired:
+        return render_template('shared_list_expired.html'), 410  # 410 Gone
+    
+    # Get gift ideas for the share owner (could be individual user or shared list)
+    user_gift_ideas = [
+        idea for idea in gift_ideas_data 
+        if idea['user_id'] == share_owner['username']
+    ]
+    
+    # Sort by priority
+    user_gift_ideas.sort(key=lambda x: (x.get('priority', float('inf')), x['gift_idea_id']))
+    
+    # Get currency formatting for display
+    imgenabled = read_env_variable('IMGENABLED', 'true').lower() == 'true'
+    
+    return render_template('shared_list_public.html',
+                         gift_ideas=user_gift_ideas,
+                         share_owner=share_owner,
+                         share_link=active_link,
+                         imgenabled=imgenabled,
+                         get_full_name=get_full_name,
+                         format_currency=format_currency)
+
+@app.route('/shared/<token>/mark_bought/<int:idea_id>', methods=['POST'])
+def mark_shared_bought(token, idea_id):
+    """Allow visitors to mark items as bought in shared lists"""
+    users = load_users()
+    gift_ideas_data = load_gift_ideas()
+    
+    # Find the share link
+    share_owner = None
+    active_link = None
+    
+    for user in users:
+        if 'sharing' in user and 'public_links' in user['sharing']:
+            for link in user['sharing']['public_links']:
+                if link['token'] == token and link.get('is_active', True):
+                    expires_at = datetime.strptime(link['expires_at'], '%Y-%m-%d %H:%M:%S')
+                    if datetime.now() <= expires_at:
+                        share_owner = user
+                        active_link = link
+                    break
+    
+    if not share_owner or not active_link:
+        return jsonify({'error': 'Share link not found or expired'}), 404
+    
+    if not active_link.get('allow_purchases', False):
+        return jsonify({'error': 'Purchases not allowed for this share link'}), 403
+    
+    # Find the gift idea
+    idea = find_idea_by_id(gift_ideas_data, idea_id)
+    if not idea or idea['user_id'] != share_owner['username']:
+        return jsonify({'error': 'Gift idea not found'}), 404
+    
+    # Get visitor name from request
+    visitor_name = request.json.get('visitor_name', '').strip()
+    if not visitor_name:
+        return jsonify({'error': 'Visitor name is required'}), 400
+    
+    # Generate unique visitor ID
+    visitor_id = secrets.token_urlsafe(16)
+    
+    # Mark as bought by visitor
+    if not idea.get('bought_by'):
+        idea['bought_by'] = f"visitor:{visitor_name}"
+        idea['date_bought'] = datetime.now().strftime('%Y-%m-%d %H:%M:%S')
+        idea['visitor_id'] = visitor_id
+        
+        # Track visitor purchase
+        if 'visitor_purchases' not in active_link:
+            active_link['visitor_purchases'] = []
+        active_link['visitor_purchases'].append({
+            'idea_id': idea_id,
+            'visitor_name': visitor_name,
+            'visitor_id': visitor_id,
+            'date': datetime.now().strftime('%Y-%m-%d %H:%M:%S')
+        })
+        
+        save_gift_ideas(gift_ideas_data)
+        save_users(users)
+        
+        return jsonify({
+            'success': True, 
+            'message': 'Item marked as purchased',
+            'visitor_id': visitor_id
+        })
+    else:
+        return jsonify({'error': 'Item already purchased'}), 400
+
+@app.route('/shared/<token>/mark_not_bought/<int:idea_id>', methods=['POST'])
+def mark_shared_not_bought(token, idea_id):
+    """Allow visitors to unmark items as bought"""
+    users = load_users()
+    gift_ideas_data = load_gift_ideas()
+    
+    # Find the share link
+    share_owner = None
+    active_link = None
+    
+    for user in users:
+        if 'sharing' in user and 'public_links' in user['sharing']:
+            for link in user['sharing']['public_links']:
+                if link['token'] == token and link.get('is_active', True):
+                    expires_at = datetime.strptime(link['expires_at'], '%Y-%m-%d %H:%M:%S')
+                    if datetime.now() <= expires_at:
+                        share_owner = user
+                        active_link = link
+                    break
+    
+    if not share_owner or not active_link:
+        return jsonify({'error': 'Share link not found or expired'}), 404
+    
+    # Find the gift idea
+    idea = find_idea_by_id(gift_ideas_data, idea_id)
+    if not idea or idea['user_id'] != share_owner['username']:
+        return jsonify({'error': 'Gift idea not found'}), 404
+    
+    # Get visitor ID from request
+    visitor_id = request.json.get('visitor_id')
+    if not visitor_id:
+        return jsonify({'error': 'Visitor ID required'}), 400
+    
+    # Check if this visitor made the purchase
+    if idea.get('bought_by', '').startswith('visitor:') and idea.get('visitor_id') == visitor_id:
+        idea['bought_by'] = None
+        idea.pop('date_bought', None)
+        idea.pop('visitor_id', None)
+        
+        # Remove from visitor purchases tracking
+        if 'visitor_purchases' in active_link:
+            active_link['visitor_purchases'] = [
+                purchase for purchase in active_link['visitor_purchases']
+                if purchase['idea_id'] != idea_id
+            ]
+        
+        save_gift_ideas(gift_ideas_data)
+        save_users(users)
+        
+        return jsonify({'success': True, 'message': 'Purchase cancelled'})
+    else:
+        return jsonify({'error': 'You can only cancel your own purchases'}), 403
+    
+def generate_share_url(token):
+    """Generate share URL with proper scheme (HTTPS if available)"""
+    # Determine the scheme from headers (in case behind reverse proxy)
+    forwarded_proto = request.headers.get('X-Forwarded-Proto', request.scheme)
+    scheme = forwarded_proto.split(',')[0].strip()  # Handle multi-value headers
+    
+    # Generate external URL with proper scheme
+    return url_for("shared_list", token=token, _external=True, _scheme=scheme)
 
 if __name__ == "__main__":
     app.run(host='0.0.0.0', port=5000, debug=True)
