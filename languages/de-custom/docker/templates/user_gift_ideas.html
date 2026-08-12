@@ -314,7 +314,7 @@
                             {% endif %}
                         </p>
                     {% if gift_idea.bought_by == session['username'] %}
-                    <button class="bg-red-500 text-white px-3 py-1 rounded mark-as-not-bought-button" data-idea-id="{{ gift_idea.gift_idea_id }}">Cancel the purchase</button>
+                    <button class="bg-red-500 text-white px-3 py-1 rounded mark-as-not-bought-button" data-idea-id="{{ gift_idea.gift_idea_id }}">Doch nicht schenken</button>
                     {% endif %}
                     {% else %}
                         <div class="flex flex-col">

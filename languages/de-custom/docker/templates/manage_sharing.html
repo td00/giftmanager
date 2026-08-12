@@ -109,9 +109,9 @@
             <button id="backButton" class="text-2xl px-4 py-2">Zurück</button>
             <h1 class="text-xl font-semibold">
                 {% if target_entity.get('shared_list') %}
-                    Share: {{ target_entity.full_name }}
+                    Teile: {{ target_entity.full_name }}
                 {% else %}
-                    Share My List
+                    Teile meine Wunschliste
                 {% endif %}
             </h1>
         </div>
@@ -163,8 +163,8 @@
                         <label for="link_name" class="block font-medium mb-2">Link Name:</label>
                         <input type="text" id="link_name" name="link_name" 
                                class="w-full px-3 py-2 border rounded inputer" 
-                               value="{% if target_entity.get('shared_list') %}{{ target_entity.full_name }} List{% else %}My Gift List{% endif %}" 
-                               placeholder="Give this link a name" required>
+                               value="{% if target_entity.get('shared_list') %}{{ target_entity.full_name }} List{% else %}Meine Wunschliste{% endif %}" 
+                               placeholder="Gib der Liste einen Namen" required>
                     </div>
                     <div>
                         <label for="days_valid" class="block font-medium mb-2">Gültig bis:</label>

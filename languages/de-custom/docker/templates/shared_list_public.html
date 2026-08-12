@@ -333,7 +333,7 @@
             button.addEventListener('click', () => {
                 const ideaId = button.getAttribute('data-idea-id');
                 const visitorId = button.getAttribute('data-visitor-id');
-                if (confirm('Are you sure you want to cancel this purchase?')) {
+                if (confirm('Bist du sicher, dass du dieses Produkt doch nicht schenken möchtest?')) {
                     markAsNotBought(ideaId, visitorId);
                 }
             });

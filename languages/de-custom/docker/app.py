@@ -2938,7 +2938,7 @@ def manage_sharing():
     if request.method == 'POST':
         # Create new share link
         if 'create_link' in request.form:
-            link_name = request.form.get('link_name', 'My Gift List')
+            link_name = request.form.get('link_name', 'Meine Wunschliste')
             days_valid = int(request.form.get('days_valid', 30))
             allow_purchases = request.form.get('allow_purchases', 'false') == 'true'
             
